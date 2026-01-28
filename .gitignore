@@ -1,0 +1,15 @@
+# Environment variables (CRITICAL - NEVER COMMIT)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
