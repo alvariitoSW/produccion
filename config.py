@@ -71,7 +71,7 @@ HEARTBEAT_INTERVAL = 30  # Heartbeat log interval
 # ===========================================
 # RISK LIMITS
 # ===========================================
-MAX_CONCURRENT_EVENTS = 3
+MAX_CONCURRENT_EVENTS = 24
 MAX_ALLOCATION_PER_EVENT = 1000.0  # Max USD exposure per event
 
 # ===========================================
