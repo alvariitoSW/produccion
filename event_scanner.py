@@ -75,7 +75,7 @@ class EventScanner:
     KISS: One simple job - find events we can trade.
     """
     
-    def __init__(self, max_events: int = 3):
+    def __init__(self, max_events: int = 24):
         self.max_events = max_events
         self._active_events: Dict[str, EventContext] = {}
         self._session = requests.Session()
