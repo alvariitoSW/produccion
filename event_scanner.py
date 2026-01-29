@@ -94,7 +94,7 @@ class EventScanner:
         new_events = []
         current_ts = get_current_hour_timestamp()
         
-        # Scan current hour + next 3 hours
+        # Scan current hour + next 24 hours
         hours_to_scan = 24
         
         for i in range(hours_to_scan):
