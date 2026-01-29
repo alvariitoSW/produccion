@@ -67,11 +67,12 @@ ORDER_SIZE = 5.0
 POLL_INTERVAL_SECONDS = 5  # How often to check order status
 SCANNER_INTERVAL_SECONDS = 60  # How often to scan for new events
 HEARTBEAT_INTERVAL = 30  # Heartbeat log interval
+PRE_MARKET_HOURS = 48  # How many hours ahead to scan for events
 
 # ===========================================
 # RISK LIMITS
 # ===========================================
-MAX_CONCURRENT_EVENTS = 24
+MAX_CONCURRENT_EVENTS = 2
 MAX_ALLOCATION_PER_EVENT = 1000.0  # Max USD exposure per event
 
 # ===========================================

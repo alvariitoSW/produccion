@@ -12,7 +12,7 @@ import json
 import requests
 import pytz
 
-from config import GAMMA_API
+from config import GAMMA_API, PRE_MARKET_HOURS
 from models import EventContext, MarketPhase
 
 logger = logging.getLogger(__name__)
@@ -75,9 +75,11 @@ class EventScanner:
     KISS: One simple job - find events we can trade.
     """
     
-    def __init__(self, max_events: int = 24):
+    def __init__(self, max_events: int = 48):
         self.max_events = max_events
         self._active_events: Dict[str, EventContext] = {}
+        # Track known slugs separately to avoid duplicates without limiting scan
+        self._known_slugs: set = set()
         self._session = requests.Session()
         self._session.headers.update({
             "Accept": "application/json",
@@ -87,34 +89,35 @@ class EventScanner:
     def scan_for_events(self) -> List[EventContext]:
         """
         Scan for active Bitcoin Up/Down events by generating slugs dynamically.
+        Scans up to PRE_MARKET_HOURS ahead (configurable, default 48).
         
         Returns:
-            List of discovered events
+            List of newly discovered events
         """
         new_events = []
         current_ts = get_current_hour_timestamp()
         
-        # Scan current hour + next 24 hours
-        hours_to_scan = 24
+        # Scan current hour + PRE_MARKET_HOURS ahead (e.g., 48 hours)
+        hours_to_scan = min(PRE_MARKET_HOURS, 48)
         
         for i in range(hours_to_scan):
-            # Skip if we have enough events
-            if len(self._active_events) >= self.max_events:
-                break
-            
             ts = current_ts + (i * EVENT_DURATION)
             slug = generate_slug(ts)
             
-            # Skip if already tracking
-            if slug in self._active_events:
+            # Skip if already known (discovered before)
+            if slug in self._known_slugs:
                 continue
             
             # Try to fetch this event
             event = self._fetch_event_by_slug(slug, ts)
             if event:
+                self._known_slugs.add(slug)
                 self._active_events[slug] = event
                 new_events.append(event)
                 logger.info(f"🔍 New event discovered: {slug}")
+        
+        # Cleanup old events (ended more than 5 min ago)
+        self._cleanup_ended_events()
         
         return new_events
     
@@ -194,6 +197,22 @@ class EventScanner:
         except Exception as e:
             logger.error(f"❌ Parse error: {e}")
             return None
+    
+    def _cleanup_ended_events(self) -> None:
+        """Remove events that ended more than 5 minutes ago."""
+        import time as t
+        current_time = t.time()
+        ended_slugs = []
+        
+        for slug, context in self._active_events.items():
+            # Event ended more than 5 minutes ago (1 hour duration + 300 seconds buffer)
+            if current_time > context.start_timestamp + EVENT_DURATION + 300:
+                ended_slugs.append(slug)
+        
+        for slug in ended_slugs:
+            del self._active_events[slug]
+            # Note: We DON'T remove from _known_slugs to avoid re-discovering old events
+            logger.info(f"🗑️ Cleaned up ended event: {slug}")
     
     def get_active_events(self) -> List[EventContext]:
         """Get all tracked events."""

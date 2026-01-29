@@ -73,13 +73,14 @@ class TelegramNotifier:
         )
         return self.send_message(message)
     
-    def send_ladder_placed(self, event_slug: str, order_count: int) -> bool:
+    def send_ladder_placed(self, event_slug: str, order_count: int, balance: float = 0) -> bool:
         """Notify about ladder placement."""
         message = (
             f"🪜 *LADDER COLOCADA*\n\n"
             f"📅 `{event_slug}`\n"
             f"📊 Órdenes: {order_count}\n"
             f"💵 Niveles: {', '.join([str(int(l*100)) for l in LADDER_LEVELS])}¢\n"
+            f"💰 Balance: ${balance:.2f}\n"
             "🎯 Exits: 47-49¢ (dinámico)\n"
             f"🛡️ Stop: {int(STOP_LOSS_PRICE*100)}¢"
         )

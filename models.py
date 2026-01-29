@@ -51,6 +51,11 @@ class EventContext:
     start_timestamp: float  # Unix timestamp when event goes LIVE
     phase: MarketPhase = MarketPhase.PRE_MARKET
     
+    # Real-time price data (best bids for selling)
+    # Default to None to indicate "not yet fetched"
+    yes_bid: Optional[float] = None
+    no_bid: Optional[float] = None
+    
     def time_until_start(self) -> float:
         """Seconds until event starts (negative if started)."""
         return self.start_timestamp - time.time()

@@ -117,6 +117,28 @@ class ProductionBot:
                 
                 # Check fills for active events
                 for event in self.scanner.get_active_events():
+                    # 🔍 UPDATE LIVE PRICES (for Stop-Loss)
+                    try:
+                        # Fetch YES Orderbook
+                        yes_ob = self.client._client.get_order_book(event.yes_token_id)
+                        if yes_ob and yes_ob.bids:
+                            # Find the HIGHEST bid (best exit price)
+                            # Bids may NOT be sorted, so find max
+                            best_yes_bid = max(float(b.price) for b in yes_ob.bids)
+                            # Sanity check: ignore spam bids below 10¢
+                            if best_yes_bid >= 0.10:
+                                event.yes_bid = best_yes_bid
+                        
+                        # Fetch NO Orderbook
+                        no_ob = self.client._client.get_order_book(event.no_token_id)
+                        if no_ob and no_ob.bids:
+                            best_no_bid = max(float(b.price) for b in no_ob.bids)
+                            if best_no_bid >= 0.10:
+                                event.no_bid = best_no_bid
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to update prices for {event.slug}: {e}")
+
                     self.strategy.check_fills(event)
                     
                     # Check completion

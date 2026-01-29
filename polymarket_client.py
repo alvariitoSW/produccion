@@ -214,6 +214,19 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"❌ Get orders failed: {e}")
             return []
+
+    def get_order(self, order_id: str) -> Dict[str, Any]:
+        """
+        Get a single order by ID.
+        """
+        if not self.is_connected:
+            return {}
+        
+        try:
+            return self._client.get_order(order_id)
+        except Exception as e:
+            logger.error(f"❌ Get order {order_id} failed: {e}")
+            return {}
     
     def get_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
         """

@@ -45,6 +45,13 @@ class StrategyEngine:
         
         # Track which orders we've seen as filled (order IDs)
         self._known_filled: Set[str] = set()
+        
+        # Queue for sells that failed to place (will retry each cycle)
+        self._pending_sells: List[Dict] = []  # [{token_id, side, exit_price, size, slug, entry_price, attempts}]
+        
+        # Accumulator for partial fills below minimum order size (5 shares)
+        # Key: (slug, side, token_id), Value: {size: float, value: float (size*entry for weighted avg)}
+        self._fill_accumulator: Dict[tuple, Dict] = {}
     
     def _get_exit_price(self, entry_price: float) -> float:
         """
@@ -116,7 +123,10 @@ class StrategyEngine:
                     orders_placed += 1
         
         logger.info(f"🪜 Ladder placed for {slug}: {orders_placed} orders")
-        self.notifier.send_ladder_placed(slug, orders_placed)
+        
+        # Get current balance for notification
+        balance = self.client.get_balance()
+        self.notifier.send_ladder_placed(slug, orders_placed, balance)
         
         return orders_placed
     
@@ -139,10 +149,41 @@ class StrategyEngine:
             if order.order_id in self._known_filled:
                 continue
             
-            # If order is not in open orders, it was filled (or cancelled)
+            # Use 'if not in open_orders' only as a trigger to CHECK status
             if order.order_id not in open_order_ids:
-                self._process_buy_fill(order, event)
-                self._known_filled.add(order.order_id)
+                try:
+                    # 🛡️ SAFETY CHECK: Verify it actually filled
+                    order_data = self.client.get_order(order.order_id)
+                    
+                    # Log the raw status for debugging
+                    logger.info(f"🕵️ Checking missing order {order.order_id}: {order_data}")
+
+                    # Determine if it's truly filled (API returns snake_case 'size_matched')
+                    size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
+                    status = order_data.get("status", "").upper()
+
+                    if size_matched > 0:
+                        # Update size to actual filled amount (handles partial fills)
+                        original_size = order.size
+                        order.size = size_matched 
+                        
+                        logger.info(f"✅ Order confirmed filled: {size_matched}/{original_size}")
+                        self._process_buy_fill(order, event)
+                        
+                        # Only mark as fully known if fully filled or cancelled (or MATCHED)
+                        if size_matched == original_size or status == "CANCELLED" or status == "MATCHED":
+                            self._known_filled.add(order.order_id)
+                    
+                    elif status == "CANCELLED":
+                        logger.warning(f"⚠️ Order {order.order_id} was CANCELLED (not filled). Ignoring.")
+                        self._known_filled.add(order.order_id)
+                        
+                    else:
+                        logger.warning(f"⚠️ Order {order.order_id} missing from Open Orders but status is {status}. Waiting... (size_matched={size_matched})")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error verifying fill for {order.order_id}: {e}")
+
         
         # Check sell orders (take-profit)
         for order in self._sell_orders.get(slug, []):
@@ -150,17 +191,167 @@ class StrategyEngine:
                 continue
             
             if order.order_id not in open_order_ids:
-                self._process_sell_fill(order, event, is_stop_loss=False)
-                self._known_filled.add(order.order_id)
+                try:
+                    # 🛡️ SAFETY CHECK
+                    order_data = self.client.get_order(order.order_id)
+                    size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
+                    original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
+                    status = order_data.get("status", "").upper()
+                    
+                    if size_matched > 0:
+                        # Update size to actual filled amount
+                        order.size = size_matched
+                        self._process_sell_fill(order, event, is_stop_loss=False)
+                        
+                        # Only mark complete if FULLY filled or explicitly done
+                        if size_matched >= original_size or status == "MATCHED":
+                            self._known_filled.add(order.order_id)
+                        else:
+                            # PARTIAL FILL: Log warning, order stays open for remaining
+                            logger.warning(f"⚠️ PARTIAL SELL FILL: {size_matched}/{original_size} shares. Remaining on book.")
+                            
+                    elif status == "CANCELLED":
+                         self._known_filled.add(order.order_id)
+                         
+                except Exception as e:
+                    logger.error(f"❌ Error verifying sell fill for {order.order_id}: {e}")
+
+        # Process any pending sells that failed earlier
+        self._process_pending_sells()
         
-        # Check stop-loss orders
-        for order in self._stop_loss_orders.get(slug, []):
+        # =========================================================================
+        # STOP-LOSS MONITOR (Client-Side)
+        # Only for 48¢ entries: If market drops to 18¢, dump at market price
+        # =========================================================================
+        self._check_stop_loss(event, open_order_ids)
+    
+    def _process_pending_sells(self) -> None:
+        """
+        Retry placing sell orders that failed previously.
+        Called each check_fills cycle to eventually place all sells.
+        """
+        if not self._pending_sells:
+            return
+        
+        still_pending = []
+        
+        for pending in self._pending_sells:
+            sell_order = self.client.place_limit_order(
+                token_id=pending['token_id'],
+                side=pending['side'],
+                order_type=OrderType.SELL,
+                price=pending['exit_price'],
+                size=pending['size'],
+                event_slug=pending['slug']
+            )
+            
+            if sell_order:
+                sell_order.entry_price = pending['entry_price']
+                slug = pending['slug']
+                if slug in self._sell_orders:
+                    self._sell_orders[slug].append(sell_order)
+                else:
+                    self._sell_orders[slug] = [sell_order]
+                    
+                logger.info(
+                    f"✅ PENDING SELL placed (attempt {pending['attempts']+1}): "
+                    f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
+                )
+            else:
+                # Still failing, increment attempts and keep in queue
+                pending['attempts'] += 1
+                if pending['attempts'] <= 10:  # Max 10 attempts (=50 seconds if 5s poll interval)
+                    still_pending.append(pending)
+                    logger.warning(
+                        f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
+                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                    )
+                else:
+                    # Give up after 10 attempts
+                    logger.error(
+                        f"❌ GAVE UP on SELL after 10 attempts: "
+                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
+                    )
+                    self.notifier.send_message(
+                        f"⚠️ ALERTA CRÍTICA: No se pudo colocar orden de venta después de 10 intentos. "
+                        f"Revisa manualmente: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                    )
+        
+        self._pending_sells = still_pending
+    
+    def _check_stop_loss(self, event: EventContext, open_order_ids: set) -> None:
+        """
+        Monitor sell orders from high-risk entries (48¢) for stop-loss.
+        If market price drops to STOP_LOSS_PRICE or below, dump at market.
+        """
+        slug = event.slug
+        
+        # Get current best bids from event context (populated in main loop)
+        current_bids = {
+            OrderSide.YES: event.yes_bid,
+            OrderSide.NO: event.no_bid
+        }
+        
+        for order in self._sell_orders.get(slug, []):
+            # Skip if already processed
             if order.order_id in self._known_filled:
                 continue
             
+            # Skip if order is no longer open (already filled)
             if order.order_id not in open_order_ids:
-                self._process_sell_fill(order, event, is_stop_loss=True)
-                self._known_filled.add(order.order_id)
+                continue
+            
+            # Only check stop-loss for high-risk entries (48¢)
+            entry_price = order.entry_price or 0
+            if not self._needs_stop_loss(entry_price):
+                continue
+            
+            # Get current market price (best bid)
+            current_market_price = current_bids.get(order.side)
+            
+            # Safety: Skip if no price data or price below minimum threshold (spam)
+            if current_market_price is None or current_market_price < 0.10:
+                continue
+            
+            # TRIGGER STOP-LOSS if price drops to threshold
+            if current_market_price <= STOP_LOSS_PRICE:
+                logger.warning(
+                    f"🔻 STOP-LOSS TRIGGERED: {order.side.display_name} @ {int(current_market_price*100)}¢ "
+                    f"<= {int(STOP_LOSS_PRICE*100)}¢. Dumping position!"
+                )
+                
+                # 1. Cancel the Take-Profit Order to unlock tokens
+                try:
+                    logger.info(f"🔓 Cancelling TP order {order.order_id[:8]}...")
+                    self.client.cancel_order(order.order_id)
+                    time.sleep(1.0)  # Wait for cancellation
+                    self._known_filled.add(order.order_id)  # Mark as handled
+                except Exception as e:
+                    logger.error(f"❌ Failed to cancel TP for SL: {e}")
+                    continue
+                
+                # 2. Execute Market Sell (limit sell at 1¢ to hit any bid)
+                logger.warning(f"📉 Executing MARKET SELL for {order.size} shares...")
+                dump_order = self.client.place_limit_order(
+                    token_id=order.token_id,
+                    side=order.side,
+                    order_type=OrderType.SELL,
+                    price=0.01,  # Market sell (crosses any bid)
+                    size=order.size,
+                    event_slug=slug
+                )
+                
+                if dump_order:
+                    logger.warning(f"✅ STOP-LOSS EXECUTED: Sold {order.size} shares at market")
+                    self.notifier.send_message(
+                        f"🔴 STOP-LOSS EJECUTADO: Vendido {order.size} {order.side.display_name} "
+                        f"a mercado (precio cayó a {int(current_market_price*100)}¢)"
+                    )
+                else:
+                    logger.error(f"❌ Failed to execute stop-loss market sell!")
+                    self.notifier.send_message(
+                        f"⚠️ ALERTA: Stop-loss no se pudo ejecutar. Intervención manual requerida."
+                    )
     
     def _process_buy_fill(self, order: TrackedOrder, event: EventContext) -> None:
         """Handle a buy order fill."""
@@ -189,38 +380,59 @@ class StrategyEngine:
         else:
             self._results[slug].fills_no.append(entry_price)
         
-        # Place sell order at DYNAMIC exit price
-        sell_order = self.client.place_limit_order(
-            token_id=order.token_id,
-            side=order.side,
-            order_type=OrderType.SELL,
-            price=exit_price,
-            size=order.size,
-            event_slug=slug
-        )
+        # Minimum order size for Polymarket
+        MIN_ORDER_SIZE = 5.0
         
-        if sell_order:
-            sell_order.entry_price = entry_price  # Track original entry
-            self._sell_orders[slug].append(sell_order)
+        # Accumulate fills BY EXIT PRICE to preserve the EXIT_PRICES strategy
+        # Key includes exit_price so 47¢→48¢ and 48¢→49¢ entries are tracked separately
+        acc_key = (slug, order.side, order.token_id, exit_price)
         
-        # STOP-LOSS: Only for 48¢ entries
-        if self._needs_stop_loss(entry_price):
-            stop_order = self.client.place_limit_order(
+        if acc_key not in self._fill_accumulator:
+            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+        
+        acc = self._fill_accumulator[acc_key]
+        acc['size'] += order.size
+        acc['total_entry_value'] += order.size * entry_price
+        
+        logger.info(f"📦 Accumulated for exit @{int(exit_price*100)}¢: {acc['size']:.2f} shares (need {MIN_ORDER_SIZE} to sell)")
+        
+        # Only place sell when we have enough shares for this specific exit price
+        if acc['size'] >= MIN_ORDER_SIZE:
+            sell_size = acc['size']
+            avg_entry = acc['total_entry_value'] / acc['size']
+            
+            # Reset accumulator for this exit price
+            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+            
+            # Wait for token settlement
+            time.sleep(3.0)
+            
+            sell_order = self.client.place_limit_order(
                 token_id=order.token_id,
                 side=order.side,
                 order_type=OrderType.SELL,
-                price=STOP_LOSS_PRICE,
-                size=order.size,
+                price=exit_price,  # Use the correct exit price for this entry level
+                size=sell_size,
                 event_slug=slug
             )
             
-            if stop_order:
-                stop_order.entry_price = entry_price
-                self._stop_loss_orders[slug].append(stop_order)
-                logger.info(
-                    f"🛡️ STOP-LOSS placed: {order.side.display_name} "
-                    f"@ {int(STOP_LOSS_PRICE*100)}¢ (protects {int(entry_price*100)}¢ entry)"
-                )
+            if sell_order:
+                sell_order.entry_price = avg_entry
+                self._sell_orders[slug].append(sell_order)
+                logger.info(f"✅ SELL order placed: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
+            else:
+                # Add to pending queue
+                pending = {
+                    'token_id': order.token_id,
+                    'side': order.side,
+                    'exit_price': exit_price,
+                    'size': sell_size,
+                    'slug': slug,
+                    'entry_price': avg_entry,
+                    'attempts': 1
+                }
+                self._pending_sells.append(pending)
+                logger.warning(f"⚠️ SELL failed, queued for retry: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
         
         self.notifier.send_fill(order)
     
