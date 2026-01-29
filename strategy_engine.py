@@ -194,6 +194,12 @@ class StrategyEngine:
                 try:
                     # 🛡️ SAFETY CHECK
                     order_data = self.client.get_order(order.order_id)
+                    
+                    # Skip if API returned None (order not found yet)
+                    if order_data is None:
+                        logger.debug(f"⏳ Order {order.order_id[:10]}... not found in API yet, will retry")
+                        continue
+                    
                     size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
                     original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
                     status = order_data.get("status", "").upper()
@@ -404,8 +410,7 @@ class StrategyEngine:
             # Reset accumulator for this exit price
             self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
             
-            # Wait for token settlement
-            time.sleep(3.0)
+            # No delay - pending queue handles retries if tokens not settled
             
             sell_order = self.client.place_limit_order(
                 token_id=order.token_id,

@@ -64,7 +64,7 @@ ORDER_SIZE = 5.0
 # ===========================================
 # TIMING
 # ===========================================
-POLL_INTERVAL_SECONDS = 5  # How often to check order status
+POLL_INTERVAL_SECONDS = 2  # How often to check order status (fast for quick sells)
 SCANNER_INTERVAL_SECONDS = 60  # How often to scan for new events
 HEARTBEAT_INTERVAL = 30  # Heartbeat log interval
 PRE_MARKET_HOURS = 48  # How many hours ahead to scan for events
