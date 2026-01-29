@@ -198,13 +198,28 @@ async def run_health_server():
 
 async def main():
     """Main entry point with health server."""
-    # Start health server first
-    health_runner = await run_health_server()
+    logger.info("=" * 50)
+    logger.info("🚀 STARTING APPLICATION...")
+    logger.info("=" * 50)
+    
+    # Start health server FIRST (Railway needs this quickly)
+    try:
+        health_runner = await run_health_server()
+        logger.info("✅ Health server ready")
+    except Exception as e:
+        logger.error(f"❌ Failed to start health server: {e}")
+        raise
     
     try:
-        # Run the bot
+        # Run the bot (may take time to connect)
         bot = ProductionBot()
         await bot.run()
+    except Exception as e:
+        logger.error(f"❌ Bot error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Keep health server running even if bot fails
+        await asyncio.sleep(60)  # Give time to see logs
     finally:
         await health_runner.cleanup()
 
