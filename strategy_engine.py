@@ -519,7 +519,7 @@ class StrategyEngine:
     def transition_to_live(self, event: EventContext) -> int:
         """
         Handle event going LIVE.
-        Cancel all buy orders, keep sells active.
+        Cancel all buy orders in batch (faster), keep sells active.
         
         Returns:
             Number of orders cancelled
@@ -529,17 +529,19 @@ class StrategyEngine:
         if self._states.get(slug) != StrategyState.ACCUMULATING:
             return 0
         
-        cancelled = 0
+        # Collect all unfilled buy order IDs for batch cancellation
+        order_ids_to_cancel = [
+            order.order_id
+            for order in self._buy_orders.get(slug, [])
+            if order.order_id not in self._known_filled
+        ]
         
-        # Cancel all pending buy orders
-        for order in self._buy_orders.get(slug, []):
-            if order.order_id not in self._known_filled:
-                if self.client.cancel_order(order.order_id):
-                    cancelled += 1
+        # Batch cancel (one API call instead of many)
+        cancelled = self.client.cancel_orders_batch(order_ids_to_cancel)
         
         self._states[slug] = StrategyState.EXITING
         
-        logger.info(f"🔴 LIVE MODE: {slug} | Cancelled {cancelled} buys")
+        logger.info(f"🔴 LIVE MODE: {slug} | Cancelled {cancelled} buys (batch)")
         self.notifier.send_phase_transition(event, cancelled)
         
         return cancelled

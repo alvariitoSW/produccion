@@ -227,16 +227,25 @@ class EventScanner:
     def update_phases(self) -> List[EventContext]:
         """
         Update phases for all events.
-        Returns events that transitioned to LIVE.
+        Returns events that transitioned to LIVE OR are about to (within 2 seconds).
+        This allows pre-emptive order cancellation.
         """
         transitioned = []
         
         for event in self._active_events.values():
             old_phase = event.phase
-            event.update_phase()
             
-            if old_phase == MarketPhase.PRE_MARKET and event.phase == MarketPhase.LIVE:
+            # Check if about to go LIVE (within 1 second) - pre-emptive cancellation
+            time_until = event.time_until_start()
+            if old_phase == MarketPhase.PRE_MARKET and 0 < time_until <= 1.0:
+                # Mark as LIVE early for pre-emptive cancellation
+                event.phase = MarketPhase.LIVE
                 transitioned.append(event)
-                logger.info(f"🔴 Event went LIVE: {event.slug}")
+                logger.info(f"⚡ PRE-EMPTIVE: Cancelling orders {time_until:.1f}s before LIVE: {event.slug}")
+            else:
+                event.update_phase()
+                if old_phase == MarketPhase.PRE_MARKET and event.phase == MarketPhase.LIVE:
+                    transitioned.append(event)
+                    logger.info(f"🔴 Event went LIVE: {event.slug}")
         
         return transitioned

@@ -198,6 +198,34 @@ class PolymarketClient:
             logger.error(f"❌ Cancel all failed: {e}")
             return 0
     
+    def cancel_orders_batch(self, order_ids: List[str]) -> int:
+        """
+        Cancel multiple orders at once (faster than individual cancels).
+        
+        Args:
+            order_ids: List of order IDs to cancel
+            
+        Returns:
+            Number of orders cancelled
+        """
+        if not self.is_connected or not order_ids:
+            return 0
+        
+        try:
+            # Use cancel_orders batch endpoint
+            response = self._client.cancel_orders(order_ids)
+            cancelled = response.get("canceled", [])
+            logger.info(f"❌ Batch cancelled {len(cancelled)}/{len(order_ids)} orders")
+            return len(cancelled)
+        except Exception as e:
+            logger.error(f"❌ Batch cancel failed: {e}")
+            # Fallback to individual cancels
+            cancelled = 0
+            for order_id in order_ids:
+                if self.cancel_order(order_id):
+                    cancelled += 1
+            return cancelled
+    
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders.
