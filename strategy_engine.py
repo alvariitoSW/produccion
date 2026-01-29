@@ -222,8 +222,7 @@ class StrategyEngine:
                 except Exception as e:
                     logger.error(f"❌ Error verifying sell fill for {order.order_id}: {e}")
 
-        # Process any pending sells that failed earlier
-        self._process_pending_sells()
+        # NOTE: Pending sells are processed once per cycle in main.py, not per-event
         
         # =========================================================================
         # STOP-LOSS MONITOR (Client-Side)
@@ -231,10 +230,10 @@ class StrategyEngine:
         # =========================================================================
         self._check_stop_loss(event, open_order_ids)
     
-    def _process_pending_sells(self) -> None:
+    def process_pending_sells(self) -> None:
         """
         Retry placing sell orders that failed previously.
-        Called each check_fills cycle to eventually place all sells.
+        IMPORTANT: Call this ONCE per cycle from main.py, not per-event!
         """
         if not self._pending_sells:
             return

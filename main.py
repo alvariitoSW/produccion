@@ -145,6 +145,9 @@ class ProductionBot:
                     if self.strategy.check_completion(event):
                         self.scanner.remove_event(event.slug)
                 
+                # Process pending sells ONCE per cycle (not per-event!)
+                self.strategy.process_pending_sells()
+                
                 # Heartbeat
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     last_heartbeat = now
