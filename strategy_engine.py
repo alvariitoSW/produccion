@@ -402,7 +402,9 @@ class StrategyEngine:
         logger.info(f"📦 Accumulated for exit @{int(exit_price*100)}¢: {acc['size']:.2f} shares (need {MIN_ORDER_SIZE} to sell)")
         
         # Only place sell when we have enough shares for this specific exit price
-        if acc['size'] >= MIN_ORDER_SIZE:
+        # Use 99% threshold (4.95) to handle partial fills like 4.986
+        SELL_THRESHOLD = MIN_ORDER_SIZE * 0.99  # 4.95 instead of 5.0
+        if acc['size'] >= SELL_THRESHOLD:
             sell_size = acc['size']
             avg_entry = acc['total_entry_value'] / acc['size']
             
