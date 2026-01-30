@@ -5,6 +5,8 @@ Manages ladder placement, fill tracking, and position management.
 
 import logging
 import time
+import json
+import os
 from typing import Dict, List, Optional, Set
 
 from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES
@@ -47,11 +49,44 @@ class StrategyEngine:
         self._known_filled: Set[str] = set()
         
         # Queue for sells that failed to place (will retry each cycle)
-        self._pending_sells: List[Dict] = []  # [{token_id, side, exit_price, size, slug, entry_price, attempts}]
+        # Persisted to file to survive restarts
+        self._pending_sells_file = "pending_sells.json"
+        self._pending_sells: List[Dict] = self._load_pending_sells()
         
         # Accumulator for partial fills below minimum order size (5 shares)
         # Key: (slug, side, token_id), Value: {size: float, value: float (size*entry for weighted avg)}
         self._fill_accumulator: Dict[tuple, Dict] = {}
+    
+    def _load_pending_sells(self) -> List[Dict]:
+        """Load pending sells from file (survives restarts)."""
+        try:
+            if os.path.exists(self._pending_sells_file):
+                with open(self._pending_sells_file, 'r') as f:
+                    data = json.load(f)
+                    # Restore OrderSide enum from string
+                    for item in data:
+                        if 'side' in item and isinstance(item['side'], str):
+                            item['side'] = OrderSide.YES if item['side'] == 'YES' else OrderSide.NO
+                    logger.info(f"📂 Loaded {len(data)} pending sells from file")
+                    return data
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load pending sells: {e}")
+        return []
+    
+    def _save_pending_sells(self) -> None:
+        """Save pending sells to file."""
+        try:
+            # Convert OrderSide enum to string for JSON
+            data = []
+            for item in self._pending_sells:
+                item_copy = item.copy()
+                if 'side' in item_copy and hasattr(item_copy['side'], 'name'):
+                    item_copy['side'] = item_copy['side'].name
+                data.append(item_copy)
+            with open(self._pending_sells_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not save pending sells: {e}")
     
     def _get_exit_price(self, entry_price: float) -> float:
         """
@@ -283,6 +318,7 @@ class StrategyEngine:
                     )
         
         self._pending_sells = still_pending
+        self._save_pending_sells()  # Persist to file
     
     def _check_stop_loss(self, event: EventContext, open_order_ids: set) -> None:
         """
@@ -438,6 +474,7 @@ class StrategyEngine:
                     'attempts': 1
                 }
                 self._pending_sells.append(pending)
+                self._save_pending_sells()  # Persist immediately
                 logger.warning(f"⚠️ SELL failed, queued for retry: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
         
         self.notifier.send_fill(order)
