@@ -298,23 +298,21 @@ class StrategyEngine:
                     f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
                 )
             else:
-                # Still failing, increment attempts and keep in queue
+                # Still failing, increment attempts and ALWAYS keep in queue (never give up)
                 pending['attempts'] += 1
-                if pending['attempts'] <= 10:  # Max 10 attempts (=50 seconds if 5s poll interval)
-                    still_pending.append(pending)
-                    logger.warning(
-                        f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
-                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
-                    )
-                else:
-                    # Give up after 10 attempts
-                    logger.error(
-                        f"❌ GAVE UP on SELL after 10 attempts: "
-                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
-                    )
+                still_pending.append(pending)
+                
+                # Log every attempt
+                logger.warning(
+                    f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
+                    f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                )
+                
+                # Send notification at 30 attempts (but keep trying)
+                if pending['attempts'] == 30:
                     self.notifier.send_message(
-                        f"⚠️ ALERTA CRÍTICA: No se pudo colocar orden de venta después de 10 intentos. "
-                        f"Revisa manualmente: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                        f"⚠️ AVISO: Orden de venta lleva 30+ intentos. Tokens probablemente aún no settleados. "
+                        f"Seguiré intentando: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
                     )
         
         self._pending_sells = still_pending

@@ -50,7 +50,9 @@ EXIT_PRICES = {
     0.43: 0.47,  # 43 → 47 (4¢ profit)
     0.42: 0.47,  # 42 → 47 (5¢ profit)
     0.41: 0.47,  # 41 → 47 (6¢ profit)
-    0.40: 0.47,  # 40 → 47 (7¢ profit)
+    0.39: 0.45,  # 39 → 45 (6¢ profit)
+    0.38: 0.45,  # 38 → 45 (7¢ profit)
+    0.37: 0.45,  # 37 → 45 (8¢ profit)
 }
 
 # Stop-loss configuration (only for high-risk entries)
@@ -59,7 +61,7 @@ STOP_LOSS_PRICE = 0.18  # 18¢ stop-loss
 STOP_LOSS_ENTRIES = [0.48]  # Only apply to these entry levels
 
 # Size per order (in shares)
-ORDER_SIZE = 7.5
+ORDER_SIZE = 25
 
 # ===========================================
 # TIMING
