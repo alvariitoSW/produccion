@@ -178,8 +178,40 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"❌ Cancel failed: {e}")
             return False
-    
-    def cancel_all_orders(self) -> int:
+
+    def get_token_balance(self, token_id: str) -> float:
+        """
+        Get the specific balance for a Conditional Token.
+        Used for diagnosing 'not enough balance' errors (precision mismatch).
+        
+        Args:
+            token_id: The specific token ID to check
+            
+        Returns:
+            Balance in shares (float)
+        """
+        if not self.is_connected:
+            return 0.0
+            
+        try:
+            # Query balance for specific conditional token
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            result = self._client.get_balance_allowance(params=params)
+            
+            # Balance comes in micro-units (1e6) or sometimes different decimals depending on market
+            # For conditional tokens on Polymarket/Gnosis, it's usually 6 decimals (USDC standard)
+            balance_raw = int(result.get("balance", 0))
+            balance = balance_raw / 1_000_000
+            
+            return balance
+        except Exception as e:
+            logger.error(f"❌ Failed to get token balance: {e}")
+            return 0.0
+
+    def get_market_positions(self) -> List[Dict]:
+        """
+        Get current positions.
+        """
         """
         Cancel all open orders.
         

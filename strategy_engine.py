@@ -298,8 +298,35 @@ class StrategyEngine:
                     f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
                 )
             else:
-                # Still failing, increment attempts and ALWAYS keep in queue (never give up)
+                # Still failing
                 pending['attempts'] += 1
+                
+                # --- SELF-HEALING LOGIC ---
+                # If failing repeatedly (e.g. > 5 attempts), check actual balance to fix precision mismatches
+                if pending['attempts'] >= 5 and pending['attempts'] % 5 == 0:
+                    try:
+                        actual_balance = self.client.get_token_balance(pending['token_id'])
+                        current_size = pending['size']
+                        
+                        # Case 1: We have tokens, but size mismatch (e.g. 25.0 vs 24.999999)
+                        # Tolerance: 0.0001
+                        if actual_balance > 0 and abs(actual_balance - current_size) > 0.0001:
+                            if actual_balance < current_size:
+                                logger.warning(
+                                    f"🔧 SELF-HEALING: Adjusting sell size from {current_size} to {actual_balance} "
+                                    f"(Precision/Fee mismatch detected)"
+                                )
+                                pending['size'] = actual_balance
+                            # If actual > current, we stick to current (don't sell more than intended)
+                            
+                        # Case 2: Zero balance (Ghost fill or settlement lag)
+                        elif actual_balance == 0:
+                            logger.warning(f"⚠️ SELF-HEALING: Token balance is 0. Waiting for settlement...")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Self-healing check failed: {e}")
+
+                # ALWAYS keep in queue (never give up)
                 still_pending.append(pending)
                 
                 # Log every attempt
