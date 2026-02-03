@@ -128,7 +128,25 @@ class StrategyEngine:
                 f"Only PRE_MARKET events allowed!"
             )
             return 0
-        
+            
+        # --- STATE HYDRATION (Restart Recovery) ---
+        # Before placing a new ladder, check if we already have orders!
+        existing_orders = []
+        try:
+            # Get all open orders
+            open_orders = self.client.get_open_orders()
+            # Filter for this event (by market/condition ID or checking asset IDs)
+            # Note: Polymarket API orders return 'market' which is the conditionID
+            
+            for o in open_orders:
+                # Check if order belongs to this event's markets
+                if o.get('market') == event.condition_id:
+                     existing_orders.append(o)
+                     
+        except Exception as e:
+             logger.error(f"⚠️ Failed to check existing orders during init: {e}")
+
+        # Initialize collections
         self._states[slug] = StrategyState.ACCUMULATING
         self._positions[slug] = []
         self._results[slug] = CycleResult(event_slug=slug, start_time=time.time())
@@ -136,6 +154,38 @@ class StrategyEngine:
         self._sell_orders[slug] = []
         self._stop_loss_orders[slug] = []
         
+        # If we found existing orders, HYDRATE and SKIP placement
+        if existing_orders:
+            logger.warning(f"♻️ RECOVERED {len(existing_orders)} existing orders for {slug}. DRY RUN (No new orders).")
+            
+            for o_data in existing_orders:
+                 # Reconstruct TrackedOrder
+                 try:
+                     side = OrderSide.YES if o_data.get('side') == 'BUY' and o_data.get('outcome') == 'Up' else OrderSide.NO
+                     # Note: This side logic is simplified. Real mapping depends on asset_id, but usually BUY YES Up = YES
+                     # A safer way is mapping asset_id
+                     if o_data.get('asset_id') == event.yes_token_id:
+                         side = OrderSide.YES
+                     elif o_data.get('asset_id') == event.no_token_id:
+                         side = OrderSide.NO
+                     
+                     tracked = TrackedOrder(
+                         order_id=o_data.get('id'),
+                         token_id=o_data.get('asset_id'),
+                         side=side,
+                         order_type=OrderType.BUY, # Assuming they are the ladder buys
+                         price=float(o_data.get('price', 0)),
+                         size=float(o_data.get('original_size', 0)) - float(o_data.get('size_matched', 0)),
+                         event_slug=slug
+                     )
+                     self._buy_orders[slug].append(tracked)
+                 except Exception as e:
+                     logger.error(f"⚠️ Failed to hibernate order {o_data.get('id')}: {e}")
+            
+            return 0 # CRITICAL: Return 0 so we don't place new orders
+
+        # ------------------------------------------
+
         orders_placed = 0
         
         # Place ladder on both YES and NO
