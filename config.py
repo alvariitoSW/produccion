@@ -59,7 +59,7 @@ STOP_LOSS_PRICE = 0.18  # 18¢ stop-loss
 STOP_LOSS_ENTRIES = [0.48]  # Only apply to these entry levels
 
 # Size per order (in shares)
-ORDER_SIZE = 10.0
+ORDER_SIZE = 25.0
 
 # ===========================================
 # TIMING
