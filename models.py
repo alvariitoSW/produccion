@@ -88,6 +88,9 @@ class TrackedOrder:
     
     # For matching entry to exit
     entry_price: Optional[float] = None  # Set on sell orders to track original buy
+    
+    # Track how much of this order we have already processed (accumulated/sold)
+    processed_size: float = 0.0
 
 
 @dataclass

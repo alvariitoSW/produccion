@@ -230,14 +230,24 @@ class StrategyEngine:
 
                     if size_matched > 0:
                         # Update size to actual filled amount (handles partial fills)
-                        original_size = order.size
-                        order.size = size_matched 
+                        # We use API reported original_size vs matches
                         
-                        logger.info(f"✅ Order confirmed filled: {size_matched}/{original_size}")
-                        self._process_buy_fill(order, event)
+                        # Calculate Delta
+                        delta_fill = size_matched - order.processed_size
+                        
+                        if delta_fill > 0.000001:  # Floating point tolerance
+                            logger.info(f"✅ Order fill detected: +{delta_fill:.4f} shares (Total: {size_matched})")
+                            
+                            # SAFETY: Pass delta explicitely, do NOT mutate order.size
+                            self._process_buy_fill(order, event, fill_amount=delta_fill)
+                            
+                            # Mark as processed
+                            order.processed_size = size_matched
                         
                         # Only mark as fully known if fully filled or cancelled (or MATCHED)
-                        if size_matched == original_size or status == "CANCELLED" or status == "MATCHED":
+                        api_original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
+                        
+                        if size_matched >= api_original_size or status == "CANCELLED" or status == "MATCHED":
                             self._known_filled.add(order.order_id)
                     
                     elif status == "CANCELLED":
@@ -278,9 +288,15 @@ class StrategyEngine:
                         # Only mark complete if FULLY filled or explicitly done
                         if size_matched >= original_size or status == "MATCHED":
                             self._known_filled.add(order.order_id)
-                        else:
-                            # PARTIAL FILL: Log warning, order stays open for remaining
-                            logger.warning(f"⚠️ PARTIAL SELL FILL: {size_matched}/{original_size} shares. Remaining on book.")
+                    
+                    elif status in ["CANCELED", "CANCELLED", "INVALID", "EXPIRED", "REJECTED"]:
+                        # 🗑️ Order is dead and has 0 fills. Stop tracking it.
+                        logger.warning(f"🗑️ Order {order.order_id[:10]} is {status} with 0 fills. Removing from tracker.")
+                        self._known_filled.add(order.order_id)
+                        
+                    elif size_matched > 0 and size_matched < original_size:
+                         # PARTIAL FILL: Log warning, order stays open for remaining
+                         logger.warning(f"⚠️ PARTIAL SELL FILL: {size_matched}/{original_size} shares. Remaining on book.")
                             
                     elif status == "CANCELLED":
                          self._known_filled.add(order.order_id)
@@ -454,11 +470,15 @@ class StrategyEngine:
                         f"⚠️ ALERTA: Stop-loss no se pudo ejecutar. Intervención manual requerida."
                     )
     
-    def _process_buy_fill(self, order: TrackedOrder, event: EventContext) -> None:
+    def _process_buy_fill(self, order: TrackedOrder, event: EventContext, fill_amount: Optional[float] = None) -> None:
         """Handle a buy order fill."""
         slug = event.slug
         entry_price = order.price
         exit_price = self._get_exit_price(entry_price)
+        
+        # Use provided fill_amount (processed delta) or fallback to order.size
+        # The mutation of order.size is dangerous, so explicit arg is better.
+        actual_size = fill_amount if fill_amount is not None else order.size
         
         logger.info(
             f"✅ BUY FILLED: {order.side.display_name} @ {int(entry_price*100)}¢ "
@@ -469,7 +489,7 @@ class StrategyEngine:
         position = Position(
             side=order.side,
             entry_price=entry_price,
-            size=order.size,
+            size=actual_size,
             token_id=order.token_id,
             event_slug=slug
         )
@@ -492,8 +512,8 @@ class StrategyEngine:
             self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
         
         acc = self._fill_accumulator[acc_key]
-        acc['size'] += order.size
-        acc['total_entry_value'] += order.size * entry_price
+        acc['size'] += actual_size
+        acc['total_entry_value'] += actual_size * entry_price
         
         logger.info(f"📦 Accumulated for exit @{int(exit_price*100)}¢: {acc['size']:.2f} shares (need {MIN_ORDER_SIZE} to sell)")
         
@@ -536,7 +556,59 @@ class StrategyEngine:
                 self._pending_sells.append(pending)
                 logger.warning(f"⚠️ SELL failed, queued for retry: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
         
-        self.notifier.send_fill(order)
+    def audit_cancelled_orders(self, order_ids: List[str], event: EventContext) -> None:
+        """
+        Audit a list of BUY orders that were just cancelled.
+        If we find they actually filled (fully or partially) during the cancellation race,
+        we treat them as filled and place the corresponding sell orders.
+        """
+        if not order_ids:
+            return
+            
+        logger.info(f"🕵️ Auditing {len(order_ids)} cancelled orders for hidden fills...")
+        
+        # We need to find the TrackedOrder objects for these IDs
+        # They should still be in _buy_orders
+        orders_to_audit = []
+        for order in self._buy_orders.get(event.slug, []):
+            if order.order_id in order_ids:
+                orders_to_audit.append(order)
+        
+        for order in orders_to_audit:
+            try:
+                # Fetch final status from API
+                order_data = self.client.get_order(order.order_id)
+                
+                # Check if it has any matched size
+                size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
+                original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
+                
+                if size_matched > 0:
+                    
+                    # LOGIC:
+                    # Uses DELTA logic to prevent double counting if partial fill was already seen.
+                    delta_fill = size_matched - order.processed_size
+                    
+                    if delta_fill > 0.000001:
+                        logger.warning(
+                            f"⚠️ RACE CONDITION AUDIT: Order {order.order_id[:10]} found with +{delta_fill:.4f} hidden shares! "
+                            f"(Total: {size_matched}/{original_size})"
+                        )
+                        
+                        # SAFETY: Pass delta explicitely
+                        self._process_buy_fill(order, event, fill_amount=delta_fill)
+                        
+                        # Mark as processed
+                        order.processed_size = size_matched
+                        
+                    # If fully filled now, mark as known
+                    if size_matched >= original_size:
+                        self._known_filled.add(order.order_id)
+                        
+            except Exception as e:
+                logger.error(f"❌ Failed to audit order {order.order_id}: {e}")
+                        
+
     
     def _process_sell_fill(self, order: TrackedOrder, event: EventContext, is_stop_loss: bool = False) -> None:
         """
@@ -637,6 +709,16 @@ class StrategyEngine:
         # Batch cancel (one API call instead of many)
         cancelled = self.client.cancel_orders_batch(order_ids_to_cancel)
         
+        # =========================================================================
+        # 🛡️ RACE CONDITION AUDIT
+        # Wait 1s and check if any "cancelled" orders actually filled at the last second
+        # =========================================================================
+        if order_ids_to_cancel:
+            logger.info(f"⏳ Waiting 1s to audit {len(order_ids_to_cancel)} cancelled orders...")
+            import time
+            time.sleep(2.0) # Brief pause to let matching engine settle
+            self.audit_cancelled_orders(order_ids_to_cancel, event)
+            
         self._states[slug] = StrategyState.EXITING
         
         logger.info(f"🔴 LIVE MODE: {slug} | Cancelled {cancelled} buys (batch)")
