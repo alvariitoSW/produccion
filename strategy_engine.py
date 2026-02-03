@@ -5,8 +5,6 @@ Manages ladder placement, fill tracking, and position management.
 
 import logging
 import time
-import json
-import os
 from typing import Dict, List, Optional, Set
 
 from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES
@@ -49,44 +47,11 @@ class StrategyEngine:
         self._known_filled: Set[str] = set()
         
         # Queue for sells that failed to place (will retry each cycle)
-        # Persisted to file to survive restarts
-        self._pending_sells_file = "pending_sells.json"
-        self._pending_sells: List[Dict] = self._load_pending_sells()
+        self._pending_sells: List[Dict] = []  # [{token_id, side, exit_price, size, slug, entry_price, attempts}]
         
         # Accumulator for partial fills below minimum order size (5 shares)
         # Key: (slug, side, token_id), Value: {size: float, value: float (size*entry for weighted avg)}
         self._fill_accumulator: Dict[tuple, Dict] = {}
-    
-    def _load_pending_sells(self) -> List[Dict]:
-        """Load pending sells from file (survives restarts)."""
-        try:
-            if os.path.exists(self._pending_sells_file):
-                with open(self._pending_sells_file, 'r') as f:
-                    data = json.load(f)
-                    # Restore OrderSide enum from string
-                    for item in data:
-                        if 'side' in item and isinstance(item['side'], str):
-                            item['side'] = OrderSide.YES if item['side'] == 'YES' else OrderSide.NO
-                    logger.info(f"📂 Loaded {len(data)} pending sells from file")
-                    return data
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load pending sells: {e}")
-        return []
-    
-    def _save_pending_sells(self) -> None:
-        """Save pending sells to file."""
-        try:
-            # Convert OrderSide enum to string for JSON
-            data = []
-            for item in self._pending_sells:
-                item_copy = item.copy()
-                if 'side' in item_copy and hasattr(item_copy['side'], 'name'):
-                    item_copy['side'] = item_copy['side'].name
-                data.append(item_copy)
-            with open(self._pending_sells_file, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            logger.warning(f"⚠️ Could not save pending sells: {e}")
     
     def _get_exit_price(self, entry_price: float) -> float:
         """
@@ -128,25 +93,7 @@ class StrategyEngine:
                 f"Only PRE_MARKET events allowed!"
             )
             return 0
-            
-        # --- STATE HYDRATION (Restart Recovery) ---
-        # Before placing a new ladder, check if we already have orders!
-        existing_orders = []
-        try:
-            # Get all open orders
-            open_orders = self.client.get_open_orders()
-            # Filter for this event (by market/condition ID or checking asset IDs)
-            # Note: Polymarket API orders return 'market' which is the conditionID
-            
-            for o in open_orders:
-                # Check if order belongs to this event's markets
-                if o.get('market') == event.condition_id:
-                     existing_orders.append(o)
-                     
-        except Exception as e:
-             logger.error(f"⚠️ Failed to check existing orders during init: {e}")
-
-        # Initialize collections
+        
         self._states[slug] = StrategyState.ACCUMULATING
         self._positions[slug] = []
         self._results[slug] = CycleResult(event_slug=slug, start_time=time.time())
@@ -154,37 +101,71 @@ class StrategyEngine:
         self._sell_orders[slug] = []
         self._stop_loss_orders[slug] = []
         
-        # If we found existing orders, HYDRATE and SKIP placement
-        if existing_orders:
-            logger.warning(f"♻️ RECOVERED {len(existing_orders)} existing orders for {slug}. DRY RUN (No new orders).")
+        # =================================================================
+        # STATE RECOVERY: Check if we already have orders for this event
+        # This prevents double-ordering on bot restart
+        # =================================================================
+        try:
+            existing_orders = self.client.get_open_orders()
+            # Filter for orders belonging to this event's tokens
+            relevant_orders = [
+                o for o in existing_orders 
+                if o.get("asset_id") in [event.yes_token_id, event.no_token_id]
+            ]
             
-            for o_data in existing_orders:
-                 # Reconstruct TrackedOrder
-                 try:
-                     side = OrderSide.YES if o_data.get('side') == 'BUY' and o_data.get('outcome') == 'Up' else OrderSide.NO
-                     # Note: This side logic is simplified. Real mapping depends on asset_id, but usually BUY YES Up = YES
-                     # A safer way is mapping asset_id
-                     if o_data.get('asset_id') == event.yes_token_id:
-                         side = OrderSide.YES
-                     elif o_data.get('asset_id') == event.no_token_id:
-                         side = OrderSide.NO
-                     
-                     tracked = TrackedOrder(
-                         order_id=o_data.get('id'),
-                         token_id=o_data.get('asset_id'),
-                         side=side,
-                         order_type=OrderType.BUY, # Assuming they are the ladder buys
-                         price=float(o_data.get('price', 0)),
-                         size=float(o_data.get('original_size', 0)) - float(o_data.get('size_matched', 0)),
-                         event_slug=slug
-                     )
-                     self._buy_orders[slug].append(tracked)
-                 except Exception as e:
-                     logger.error(f"⚠️ Failed to hibernate order {o_data.get('id')}: {e}")
-            
-            return 0 # CRITICAL: Return 0 so we don't place new orders
-
-        # ------------------------------------------
+            if relevant_orders:
+                logger.info(f"♻️ STATE RECOVERY: Found {len(relevant_orders)} existing orders for {slug}. Adopting...")
+                
+                recovered_count = 0
+                for o_data in relevant_orders:
+                    try:
+                        # Reconstruct TrackedOrder from API data
+                        token_id = o_data.get("asset_id")
+                        
+                        # Determine OrderSide (YES/NO) based on token ID
+                        if token_id == event.yes_token_id:
+                            side = OrderSide.YES
+                        else:
+                            side = OrderSide.NO
+                            
+                        # Determine OrderType (BUY/SELL)
+                        type_str = o_data.get("side", "").upper()
+                        order_type = OrderType.BUY if type_str == "BUY" else OrderType.SELL
+                        
+                        tracked = TrackedOrder(
+                            order_id=o_data.get("id"),
+                            token_id=token_id,
+                            side=side,
+                            order_type=order_type,
+                            price=float(o_data.get("price", 0)),
+                            size=float(o_data.get("size", 0)), # Use 'size' or 'original_size'? Usually 'size' is remaining? No, 'size' is usually original in API responses often. Let's assume size is correct for now or use original_size.
+                            # Poly API typically returns 'size' as original and 'size_matched' as filled. 
+                            # TrackedOrder usually wants original size.
+                            event_slug=slug
+                        )
+                        
+                        # Add to appropriate list
+                        if order_type == OrderType.BUY:
+                            self._buy_orders[slug].append(tracked)
+                        else:
+                            self._sell_orders[slug].append(tracked)
+                            
+                        recovered_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Failed to recover order {o_data.get('id')}: {e}")
+                
+                logger.info(f"✅ Recovered {recovered_count} orders for {slug}. Skipping new ladder placement.")
+                
+                # Get current balance for notification (even if we didn't place new orders)
+                balance = self.client.get_balance()
+                self.notifier.send_message(f"♻️ Bot reiniciado: Recuperadas {recovered_count} órdenes para {slug}")
+                
+                # Assume initialized and return count
+                return recovered_count
+                
+        except Exception as e:
+            logger.error(f"❌ State recovery check failed: {e}")
 
         orders_placed = 0
         
@@ -351,49 +332,53 @@ class StrategyEngine:
                 # Still failing
                 pending['attempts'] += 1
                 
-                # --- SELF-HEALING LOGIC ---
-                # If failing repeatedly (e.g. > 5 attempts), check actual balance to fix precision mismatches
-                if pending['attempts'] >= 5 and pending['attempts'] % 5 == 0:
+                # SMART RETRY LOGIC (Apply after 5 failures)
+                if pending['attempts'] >= 5:
                     try:
+                        # Check ACTUAL token balance
                         actual_balance = self.client.get_token_balance(pending['token_id'])
-                        current_size = pending['size']
                         
-                        # Case 1: We have tokens, but size mismatch (e.g. 25.0 vs 24.999999)
-                        # Tolerance: 0.0001
-                        if actual_balance > 0 and abs(actual_balance - current_size) > 0.0001:
-                            if actual_balance < current_size:
-                                logger.warning(
-                                    f"🔧 SELF-HEALING: Adjusting sell size from {current_size} to {actual_balance} "
-                                    f"(Precision/Fee mismatch detected)"
-                                )
-                                pending['size'] = actual_balance
-                            # If actual > current, we stick to current (don't sell more than intended)
+                        if actual_balance == 0:
+                            # Settlement delay - keep waiting indefinitely
+                            # Reset attempts to 4 to keep checking but avoid "giving up"
+                            pending['attempts'] = 4
+                            logger.debug(f"⏳ Settlement delay (bal=0) for {pending['slug']}. Waiting...")
+                            still_pending.append(pending)
+                            continue
                             
-                        # Case 2: Zero balance (Ghost fill or settlement lag)
-                        elif actual_balance == 0:
-                            logger.warning(f"⚠️ SELF-HEALING: Token balance is 0. Waiting for settlement...")
+                        elif 0 < actual_balance < pending['size']:
+                            # PRECISION ISSUE: We have shares, but less than we sell.
+                            # Resize to match actual balance exactly.
+                            logger.warning(
+                                f"📉 Mismatched balance! Resizing {pending['size']} -> {actual_balance} "
+                                f"for {pending['slug']}"
+                            )
+                            pending['size'] = actual_balance
+                            pending['attempts'] = 0  # Reset retries for new size
+                            still_pending.append(pending)
+                            continue
                             
                     except Exception as e:
-                        logger.error(f"❌ Self-healing check failed: {e}")
+                        logger.error(f"❌ Error checking balance for smart retry: {e}")
 
-                # ALWAYS keep in queue (never give up)
-                still_pending.append(pending)
-                
-                # Log every attempt
-                logger.warning(
-                    f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
-                    f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
-                )
-                
-                # Send notification at 30 attempts (but keep trying)
-                if pending['attempts'] == 30:
+                if pending['attempts'] <= 10:  # Max 10 attempts for GENERIC errors
+                    still_pending.append(pending)
+                    logger.warning(
+                        f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
+                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                    )
+                else:
+                    # Give up after 10 attempts (only for non-balance errors)
+                    logger.error(
+                        f"❌ GAVE UP on SELL after 10 attempts: "
+                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
+                    )
                     self.notifier.send_message(
-                        f"⚠️ AVISO: Orden de venta lleva 30+ intentos. Tokens probablemente aún no settleados. "
-                        f"Seguiré intentando: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                        f"⚠️ ALERTA CRÍTICA: No se pudo colocar orden de venta después de 10 intentos. "
+                        f"Revisa manualmente: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
                     )
         
         self._pending_sells = still_pending
-        self._save_pending_sells()  # Persist to file
     
     def _check_stop_loss(self, event: EventContext, open_order_ids: set) -> None:
         """
@@ -549,7 +534,6 @@ class StrategyEngine:
                     'attempts': 1
                 }
                 self._pending_sells.append(pending)
-                self._save_pending_sells()  # Persist immediately
                 logger.warning(f"⚠️ SELL failed, queued for retry: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
         
         self.notifier.send_fill(order)
