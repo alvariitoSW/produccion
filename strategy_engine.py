@@ -237,7 +237,26 @@ class StrategyEngine:
                 order_data = self.client.get_order(order.order_id)
                 
                 if not order_data:
+                    # IMPROVEMENT: Track API failures to detect phantom fills
+                    if not hasattr(order, 'api_fail_count'):
+                        order.api_fail_count = 0
+                    order.api_fail_count += 1
+                    
+                    if order.api_fail_count >= 20:  # ~10 seconds of failures
+                        logger.error(
+                            f"⚠️ API failing consistently for {order.order_id[:10]} "
+                            f"(x{order.api_fail_count}). Possible phantom fill!"
+                        )
+                        self.notifier.send_message(
+                            f"⚠️ ALERTA: API no responde para orden {order.order_id[:10]}. "
+                            f"Verificar manualmente si hay tokens comprados."
+                        )
+                        order.api_fail_count = 0  # Reset to avoid spam
                     continue
+                
+                # Reset fail counter on success
+                if hasattr(order, 'api_fail_count'):
+                    order.api_fail_count = 0
                 
                 size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
                 status = order_data.get("status", "").upper()
@@ -522,14 +541,31 @@ class StrategyEngine:
                 )
                 
                 # 1. Cancel the Take-Profit Order to unlock tokens
+                cancel_success = False
                 try:
                     logger.info(f"🔓 Cancelling TP order {order.order_id[:8]}...")
                     self.client.cancel_order(order.order_id)
-                    # No sleep needed - cancel is synchronous
-                    self._known_filled.add(order.order_id)  # Mark as handled
+                    cancel_success = True
                 except Exception as e:
                     logger.error(f"❌ Failed to cancel TP for SL: {e}")
-                    continue
+                    # CRITICAL FIX: Verify if order was actually cancelled (timeout scenario)
+                    try:
+                        order_status = self.client.get_order(order.order_id)
+                        if order_status is None:
+                            logger.warning("📋 Order not found - likely cancelled. Proceeding with SL...")
+                            cancel_success = True
+                        elif order_status.get("status", "").upper() in ["CANCELLED", "CANCELED", "MATCHED"]:
+                            logger.warning(f"📋 Order status: {order_status.get('status')}. Proceeding with SL...")
+                            cancel_success = True
+                        else:
+                            logger.error(f"❌ Order still active: {order_status.get('status')}. Cannot proceed.")
+                    except Exception as e2:
+                        logger.error(f"❌ Failed to verify order status: {e2}")
+                
+                if not cancel_success:
+                    continue  # Really failed, retry next cycle
+                
+                self._known_filled.add(order.order_id)  # Mark as handled
                 
                 # 2. Execute Market Sell (limit sell at 1¢ to hit any bid)
                 logger.warning(f"📉 Executing MARKET SELL for {order.size} shares...")

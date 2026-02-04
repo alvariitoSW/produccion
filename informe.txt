@@ -1073,5 +1073,312 @@ SOLUCIÓN IMPLEMENTADA (múltiples lugares):
 4. Agregar health check endpoint para monitoreo
 
 ================================================================================
+7. ANÁLISIS DE FALLOS REPORTADOS POR AUDITOR EXTERNO
+================================================================================
+
+A continuación se analiza cada fallo reportado, determinando su VERACIDAD
+y el IMPACTO REAL en la estrategia.
+
+-------------------------------------------------------------------------------
+FALLO 1: ☠️ LA TRAMPA DEL STOP-LOSS
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+Si cancel_order() falla por timeout (servidor cancela pero bot recibe error),
+el bot entra en bucle infinito intentando cancelar una orden fantasma.
+
+CÓDIGO RELEVANTE (líneas 525-533):
+    try:
+        self.client.cancel_order(order.order_id)
+        self._known_filled.add(order.order_id)  # Mark as handled
+    except Exception as e:
+        logger.error(f"❌ Failed to cancel TP for SL: {e}")
+        continue
+
+VEREDICTO: ✅ VERDADERO - FALLO REAL
+
+ANÁLISIS:
+El auditor tiene RAZÓN. Si la cancelación tiene éxito en el servidor pero
+el bot recibe un error de red:
+
+1. El bot hace `continue` y NO marca la orden como procesada
+2. En el siguiente ciclo, `order.order_id` NO está en `_known_filled`
+3. El bot intenta cancelar de nuevo → API dice "orden no existe" → Exception
+4. Bucle infinito mientras el precio cae
+
+IMPACTO: CRÍTICO - Pérdida potencial total de la posición
+
+SOLUCIÓN PROPUESTA:
+    try:
+        self.client.cancel_order(order.order_id)
+    except Exception as e:
+        logger.error(f"❌ Failed to cancel TP for SL: {e}")
+        # NUEVO: Verificar si la orden realmente existe
+        try:
+            order_status = self.client.get_order(order.order_id)
+            if order_status is None or order_status.get("status") in ["CANCELLED", "CANCELED"]:
+                logger.warning("📋 Orden ya cancelada (timeout anterior). Procediendo...")
+                # Continuar con la venta de pánico
+            else:
+                continue  # Realmente falló, reintentar
+        except:
+            continue
+    
+    self._known_filled.add(order.order_id)
+    # ... ejecutar venta de pánico ...
+
+-------------------------------------------------------------------------------
+FALLO 2: 🧠 AMNESIA POST-REINICIO (Pérdida de Dust)
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+El _fill_accumulator vive solo en RAM. Si el bot se reinicia, pierde la
+memoria de shares parciales acumuladas, dejándolas huérfanas.
+
+CÓDIGO RELEVANTE (línea 50):
+    self._fill_accumulator: Dict[tuple, Dict] = {}  # Solo en RAM
+
+VEREDICTO: ✅ VERDADERO - FALLO REAL (pero impacto BAJO)
+
+ANÁLISIS:
+El auditor tiene RAZÓN técnicamente. El acumulador NO se persiste.
+
+ESCENARIO:
+1. Bot compra 0.5 shares (acumulando para llegar a ~2.1 shares = $1)
+2. Bot crashea
+3. Al reiniciar, _fill_accumulator = {} (vacío)
+4. Las 0.5 shares están en la wallet pero el bot no las "conoce"
+
+SIN EMBARGO, hay mitigaciones:
+
+MITIGACIÓN 1: El acumulador se vacía rápido
+- Si ORDER_SIZE = 50 shares y el precio es 48¢
+- El mínimo requerido es ~2.1 shares ($1 / 0.48)
+- Un solo fill de 50 shares >> 2.1, así que se vende inmediatamente
+- El acumulador solo tiene datos "pendientes" por fracciones de segundo
+
+MITIGACIÓN 2: Al pasar a LIVE, _flush_accumulator_for_event() procesa todo
+- Si hay dust y el evento pasa a LIVE, se intenta vender
+- El peor caso es perder el dust (< $1 por definición)
+
+IMPACTO: BAJO - Máxima pérdida = $0.99 por posición en el peor caso
+
+SOLUCIÓN PROPUESTA (opcional):
+Persistir _fill_accumulator en archivo JSON o Redis, aunque el ROI
+de implementarlo es cuestionable dado el bajo impacto.
+
+-------------------------------------------------------------------------------
+FALLO 3: 🎰 EL "INVERSOR ACCIDENTAL" (Race Condition en Transición)
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+Si una venta se ejecuta justo antes de LIVE, el bot recarga (compra) porque
+su estado aún es ACCUMULATING. La compra puede llenar antes de que
+transition_to_live() cancele, dejando una posición no deseada.
+
+CÓDIGO RELEVANTE (líneas 940-954):
+    if self._states.get(slug) == StrategyState.ACCUMULATING and not is_stop_loss:
+        reload_order = self.client.place_limit_order(
+            price=entry_price,  # Ej: 48¢
+            ...
+        )
+
+VEREDICTO: ⚠️ PARCIALMENTE VERDADERO - Riesgo BAJO
+
+ANÁLISIS:
+El auditor tiene razón en la MECÁNICA, pero ignora factores mitigantes:
+
+MITIGACIÓN 1: Los reloads son órdenes LÍMITE, no de mercado
+- Se colocan a 40-48¢ (precios de la escalera)
+- Para que se llenen instantáneamente, el mercado tendría que caer a esos precios
+- Si el mercado está subiendo hacia LIVE, estas órdenes NO se llenan
+
+MITIGACIÓN 2: audit_cancelled_orders() detecta fills de última hora
+- Incluso si la orden se llena durante la cancelación, se detecta
+- Se coloca la venta correspondiente
+
+MITIGACIÓN 3: La ventana de tiempo es mínima
+- El ciclo del bot es ~0.5 segundos
+- La probabilidad de que TODO esto ocurra en ese instante es muy baja
+
+ESCENARIO DE RIESGO REAL:
+1. Take-profit @ 49¢ se ejecuta (el mercado está alto)
+2. Bot coloca reload buy @ 48¢
+3. Flash crash instantáneo llena el buy @ 48¢
+4. Evento pasa a LIVE
+5. Bot cancela buys pero la orden ya llenó
+6. audit_cancelled_orders() detecta el fill y coloca sell
+
+IMPACTO: BAJO - El sistema YA tiene manejo de este caso con audit_cancelled_orders()
+
+SOLUCIÓN ADICIONAL (defensiva):
+    # Antes de recargar, verificar si el evento está por pasar a LIVE
+    if self._states.get(slug) == StrategyState.ACCUMULATING and not is_stop_loss:
+        # NUEVO: Verificar tiempo restante del evento
+        if event.time_to_live is not None and event.time_to_live < 60:  # < 1 min
+            logger.warning("⏰ Evento próximo a LIVE, omitiendo reload")
+            return
+        
+        reload_order = self.client.place_limit_order(...)
+
+-------------------------------------------------------------------------------
+FALLO 4: 👻 FILLS "FANTASMA" (Dependencia de API)
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+Si la API devuelve None repetidamente para una orden que sí se llenó,
+el bot nunca se entera y no coloca la venta.
+
+CÓDIGO RELEVANTE (líneas 239-241):
+    order_data = self.client.get_order(order.order_id)
+    
+    if not order_data:
+        continue
+
+VEREDICTO: ⚠️ PARCIALMENTE VERDADERO - Riesgo MEDIO
+
+ANÁLISIS:
+El auditor tiene razón en que un `continue` silencioso es peligroso.
+
+SIN EMBARGO, hay mitigaciones:
+
+MITIGACIÓN 1: La detección principal NO usa get_order()
+- check_fills() PRIMERO verifica si `order.order_id not in open_order_ids`
+- open_order_ids viene de get_open_orders() (lista de todas las órdenes)
+- Si una orden desaparece de la lista, SABEMOS que algo pasó
+
+MITIGACIÓN 2: Las órdenes de alta prioridad (≥46¢) se verifican siempre
+- Aunque la orden siga "abierta", se llama get_order() cada ciclo
+- Solo las de baja prioridad (<46¢) que siguen abiertas se saltan
+
+MITIGACIÓN 3: El balance real está en la blockchain
+- Si compramos tokens, ESTÁN en nuestra wallet
+- Aunque el bot no lo sepa, no se "pierden"
+
+ESCENARIO DE RIESGO REAL:
+1. Orden @ 44¢ se llena parcialmente (10 de 50 shares)
+2. API get_order() devuelve None por lag
+3. La orden sigue en open_order_ids (no desapareció)
+4. Bot no detecta el partial fill
+5. Tokens comprados pero sin venta colocada
+
+IMPACTO: MEDIO - Posible posición huérfana que requiere intervención manual
+
+SOLUCIÓN PROPUESTA:
+    order_data = self.client.get_order(order.order_id)
+    
+    if not order_data:
+        # NUEVO: Contar intentos fallidos
+        if not hasattr(order, 'api_fail_count'):
+            order.api_fail_count = 0
+        order.api_fail_count += 1
+        
+        if order.api_fail_count >= 10:
+            logger.error(f"⚠️ API failing for order {order.order_id[:10]} x{order.api_fail_count}")
+            self.notifier.send_message(f"⚠️ ALERTA: API no responde para orden. Verificar manualmente.")
+        continue
+
+-------------------------------------------------------------------------------
+FALLO 5: 💧 RIESGO DE LIQUIDEZ EN MARKET SELL
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+La orden de stop-loss a 1¢ puede ejecutarse a precios ridículos si no hay
+compradores en el libro de órdenes.
+
+CÓDIGO RELEVANTE (líneas 537-540):
+    dump_order = self.client.place_limit_order(
+        price=0.01,  # Market sell (crosses any bid)
+        size=order.size,
+        ...
+    )
+
+VEREDICTO: ✅ VERDADERO - Pero es ACEPTABLE por diseño
+
+ANÁLISIS:
+El auditor tiene RAZÓN técnicamente. En un flash crash extremo con libro
+de órdenes vacío, la ejecución sería catastrófica.
+
+SIN EMBARGO, esto es un TRADEOFF CONSCIENTE:
+
+ARGUMENTO 1: El objetivo del stop-loss es SALIR, no obtener buen precio
+- Si el precio cayó de 48¢ a 18¢, ya perdimos 62.5%
+- Vender a 15¢ vs 10¢ vs 5¢ es irrelevante comparado con perder 100%
+
+ARGUMENTO 2: En mercados de predicción, 0 o 100 son los únicos finales
+- Si NO vendemos y el mercado resuelve en contra, perdemos TODO
+- Vender a 5¢ es infinitamente mejor que recibir $0 al resolver
+
+ARGUMENTO 3: Los mercados de Polymarket tienen liquidez razonable
+- No son shitcoins de DEX con 3 holders
+- Mercados de eventos políticos tienen millones en volumen
+
+IMPACTO: ACEPTABLE - El slippage extremo es preferible a pérdida total
+
+SOLUCIÓN ALTERNATIVA (si se desea):
+Usar precio mínimo más alto (ej: 5¢ en lugar de 1¢) para limitar slippage,
+aceptando el riesgo de que la orden no se llene si no hay bids.
+
+-------------------------------------------------------------------------------
+FALLO 6: 🔒 BLOQUEO POR INTERVENCIÓN HUMANA
+-------------------------------------------------------------------------------
+ALEGACIÓN:
+Si el usuario coloca manualmente una orden de venta, bloquea los tokens
+y el bot no puede operar, entrando en loop de errores.
+
+CÓDIGO RELEVANTE (cálculo de locked_in_sells):
+    locked_in_sells = sum(
+        float(o.get("size", 0)) - float(o.get("size_matched", 0))
+        for o in open_orders
+        if o.get("asset_id") == token_id and o.get("side") == "SELL"
+    )
+    available_balance = actual_balance - locked_in_sells
+
+VEREDICTO: ✅ VERDADERO - Pero es COMPORTAMIENTO CORRECTO
+
+ANÁLISIS:
+El auditor describe correctamente el comportamiento, pero lo interpreta
+como un "fallo" cuando en realidad es PROTECCIÓN.
+
+ARGUMENTO 1: El bot DEBERÍA detenerse si hay intervención manual
+- Si el humano colocó una orden, tiene una razón
+- El bot no debe competir con el humano por los mismos tokens
+
+ARGUMENTO 2: El logging no es "llenar de errores"
+- El bot detecta la situación y la reporta claramente
+- "🔒 Tokens locked: X total, Y in open sells"
+- Esto es INFORMATIVO, no un error
+
+ARGUMENTO 3: El bot se adapta
+- Si quedan tokens disponibles, los usa
+- Si no, espera a que la orden manual se resuelva
+
+IMPACTO: NO ES UN FALLO - Es comportamiento defensivo correcto
+
+RECOMENDACIÓN: Agregar detección explícita de órdenes "no conocidas"
+    # Detectar si hay órdenes que el bot no colocó
+    unknown_sells = [
+        o for o in open_orders
+        if o.get("asset_id") == token_id
+        and o.get("side") == "SELL"
+        and o.get("id") not in [s.order_id for s in self._sell_orders.get(slug, [])]
+    ]
+    if unknown_sells:
+        logger.warning(f"⚠️ Detected {len(unknown_sells)} manual sell orders!")
+        self.notifier.send_message("⚠️ Órdenes manuales detectadas. Bot pausado.")
+
+===============================================================================
+RESUMEN DE FALLOS
+===============================================================================
+
+| # | Fallo                          | Veredicto        | Impacto   | Acción    |
+|---|--------------------------------|------------------|-----------|-----------|
+| 1 | Trampa del Stop-Loss           | ✅ VERDADERO     | CRÍTICO   | CORREGIR  |
+| 2 | Amnesia Post-Reinicio          | ✅ VERDADERO     | BAJO      | ACEPTAR   |
+| 3 | Inversor Accidental            | ⚠️ PARCIAL       | BAJO      | MITIGADO  |
+| 4 | Fills Fantasma                 | ⚠️ PARCIAL       | MEDIO     | MEJORAR   |
+| 5 | Riesgo de Liquidez             | ✅ VERDADERO     | ACEPTABLE | POR DISEÑO|
+| 6 | Bloqueo por Intervención       | ❌ NO ES FALLO   | N/A       | CORRECTO  |
+
+CONCLUSIÓN:
+Solo el FALLO 1 (Trampa del Stop-Loss) requiere corrección URGENTE.
+Los demás son riesgos aceptables, mitigados, o comportamiento correcto.
+
+================================================================================
                          FIN DEL INFORME DE AUDITORÍA
 ================================================================================
