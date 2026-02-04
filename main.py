@@ -115,6 +115,12 @@ class ProductionBot:
                 for event in transitioned:
                     self.strategy.transition_to_live(event)
                 
+                # ====================================================
+                # OPTIMIZATION: Fetch open orders ONCE per cycle
+                # ====================================================
+                all_open_orders = self.client.get_open_orders()
+                global_open_ids = {o.get("id") for o in all_open_orders}
+                
                 # Check fills for active events
                 for event in self.scanner.get_active_events():
                     # 🔍 UPDATE LIVE PRICES (for Stop-Loss)
@@ -139,10 +145,11 @@ class ProductionBot:
                     except Exception as e:
                         logger.warning(f"⚠️ Failed to update prices for {event.slug}: {e}")
 
-                    self.strategy.check_fills(event)
+                    # Check fills with pre-fetched open orders (avoids N API calls)
+                    self.strategy.check_fills(event, global_open_ids)
                     
-                    # Check completion
-                    if self.strategy.check_completion(event):
+                    # Check completion (reuses same open_order_ids)
+                    if self.strategy.check_completion(event, global_open_ids):
                         self.scanner.remove_event(event.slug)
                 
                 # Process pending sells ONCE per cycle (not per-event!)

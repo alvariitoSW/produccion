@@ -10,9 +10,12 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 
+import time as time_module
+
 from config import (
     CLOB_HOST, CHAIN_ID,
-    PRIVATE_KEY, FUNDER_ADDRESS
+    PRIVATE_KEY, FUNDER_ADDRESS,
+    SELL_RETRY_ATTEMPTS, SELL_RETRY_DELAY
 )
 from models import OrderSide, OrderType, TrackedOrder
 
@@ -100,6 +103,7 @@ class PolymarketClient:
     ) -> Optional[TrackedOrder]:
         """
         Place a limit order on Polymarket.
+        SELL orders have automatic retry (critical for arbitrage).
         
         Args:
             token_id: YES or NO token ID
@@ -116,47 +120,64 @@ class PolymarketClient:
             logger.error("❌ Not connected")
             return None
         
-        try:
-            # Map to py-clob-client types
-            clob_side = BUY if order_type == OrderType.BUY else SELL
-            
-            order_args = OrderArgs(
-                price=price,
-                size=size,
-                side=clob_side,
-                token_id=token_id
-            )
-            
-            # Create and post the order
-            signed_order = self._client.create_order(order_args)
-            response = self._client.post_order(signed_order, ClobOrderType.GTC)
-            
-            order_id = response.get("orderID", "")
-            
-            if not order_id:
-                logger.error(f"❌ Order placement failed: {response}")
+        # SELL orders are critical - retry on failure
+        max_attempts = SELL_RETRY_ATTEMPTS if order_type == OrderType.SELL else 1
+        
+        for attempt in range(max_attempts):
+            try:
+                # Map to py-clob-client types
+                clob_side = BUY if order_type == OrderType.BUY else SELL
+                
+                order_args = OrderArgs(
+                    price=price,
+                    size=size,
+                    side=clob_side,
+                    token_id=token_id
+                )
+                
+                # Create and post the order
+                signed_order = self._client.create_order(order_args)
+                response = self._client.post_order(signed_order, ClobOrderType.GTC)
+                
+                order_id = response.get("orderID", "")
+                
+                if not order_id:
+                    error_msg = response.get("error", response.get("message", str(response)))
+                    logger.error(f"❌ Order failed (attempt {attempt+1}/{max_attempts}): {error_msg}")
+                    
+                    # Retry SELL orders after brief delay
+                    if order_type == OrderType.SELL and attempt < max_attempts - 1:
+                        time_module.sleep(SELL_RETRY_DELAY * (attempt + 1))
+                        continue
+                    return None
+                
+                tracked = TrackedOrder(
+                    order_id=order_id,
+                    token_id=token_id,
+                    side=side,
+                    order_type=order_type,
+                    price=price,
+                    size=size,
+                    event_slug=event_slug
+                )
+                
+                logger.info(
+                    f"📝 Order placed: {order_type.value} {side.display_name} "
+                    f"@ {int(price*100)}¢ x{size} | ID: {order_id[:8]}..."
+                )
+                
+                return tracked
+                
+            except Exception as e:
+                logger.error(f"❌ Order error (attempt {attempt+1}/{max_attempts}): {e}")
+                
+                # Retry SELL orders after brief delay
+                if order_type == OrderType.SELL and attempt < max_attempts - 1:
+                    time_module.sleep(SELL_RETRY_DELAY * (attempt + 1))
+                    continue
                 return None
-            
-            tracked = TrackedOrder(
-                order_id=order_id,
-                token_id=token_id,
-                side=side,
-                order_type=order_type,
-                price=price,
-                size=size,
-                event_slug=event_slug
-            )
-            
-            logger.info(
-                f"📝 Order placed: {order_type.value} {side.display_name} "
-                f"@ {int(price*100)}¢ x{size} | ID: {order_id[:8]}..."
-            )
-            
-            return tracked
-            
-        except Exception as e:
-            logger.error(f"❌ Order placement error: {e}")
-            return None
+        
+        return None
     
     def cancel_order(self, order_id: str) -> bool:
         """
@@ -327,27 +348,6 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"❌ Get order book failed: {e}")
             return None
-    
-    def get_balance(self) -> float:
-        """
-        Get USDC balance.
-        
-        Returns:
-            Balance in USDC
-        """
-        if not self.is_connected:
-            return 0.0
-        
-        try:
-            balance_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            result = self._client.get_balance_allowance(params=balance_params)
-            # Balance is in micro-units (1e6)
-            balance_raw = int(result.get("balance", 0))
-            return balance_raw / 1_000_000
-        except Exception as e:
-            logger.error(f"❌ Get balance failed: {e}")
-            return 0.0
-            return 0.0
 
 
 # Singleton instance

@@ -64,12 +64,29 @@ STOP_LOSS_ENTRIES = [0.48]  # Only apply to these entry levels
 ORDER_SIZE = 30.0
 
 # ===========================================
-# TIMING
+# TIMING (Optimized for Polymarket CLOB API limits)
 # ===========================================
-POLL_INTERVAL_SECONDS = 2   # How often to check order status (fast for quick sells)
+# API Limits Reference:
+#   - GET endpoints: ~900 req/10s (90/s)
+#   - POST /order: 3,500 req/10s (350/s burst)
+#   - Practical recommendation: 5-10 orders/s
+#
+# Our usage per cycle (~2 events, 18 orders each):
+#   - ~1 get_open_orders + ~4 get_order_book + ~36 get_order = ~41 req/cycle
+#   - At 0.5s poll: 82 req/s (safe, under 90/s limit)
+
+POLL_INTERVAL_SECONDS = 0.5   # Aggressive polling (82 req/s < 90/s limit)
 SCANNER_INTERVAL_SECONDS = 60  # How often to scan for new events
 HEARTBEAT_INTERVAL = 30  # Heartbeat log interval
 PRE_MARKET_HOURS = 48  # How many hours ahead to scan for events
+
+# ===========================================
+# SELL ORDER RELIABILITY (Speed-optimized)
+# ===========================================
+# POST /order limit: 350/s burst, but practical limit is 5-10/s
+# We retry fast to catch settlement delays
+SELL_RETRY_ATTEMPTS = 3      # Retries for SELL orders (critical)
+SELL_RETRY_DELAY = 0.1       # Fast retry (100ms) - API can handle it
 
 # ===========================================
 # RISK LIMITS

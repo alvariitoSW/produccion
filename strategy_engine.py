@@ -196,69 +196,79 @@ class StrategyEngine:
         
         return orders_placed
     
-    def check_fills(self, event: EventContext) -> None:
+    def check_fills(self, event: EventContext, open_order_ids: set = None) -> None:
         """
         Check for filled orders and process them.
-        Uses the CLOB API to check order status.
+        Now checks PARTIAL fills on OPEN orders too (critical fix).
+        
+        Args:
+            event: The event context
+            open_order_ids: Pre-fetched set of open order IDs (from main.py)
         """
         slug = event.slug
         
         if slug not in self._states:
             return
         
-        # Get current open orders from API
-        open_orders = self.client.get_open_orders()
-        open_order_ids = {o.get("id") for o in open_orders}
+        # Use provided open_order_ids or fetch (fallback)
+        if open_order_ids is None:
+            open_orders = self.client.get_open_orders()
+            open_order_ids = {o.get("id") for o in open_orders}
         
-        # Check buy orders
-        for order in self._buy_orders.get(slug, []):
-            if order.order_id in self._known_filled:
-                continue
+        # =================================================================
+        # CHECK BUY ORDERS (OPTIMIZED: Priority check + smart filtering)
+        # =================================================================
+        # Sort by price DESC (48¢ first - most likely to fill)
+        buy_orders = self._buy_orders.get(slug, [])
+        active_buys = [o for o in buy_orders if o.order_id not in self._known_filled]
+        active_buys_sorted = sorted(active_buys, key=lambda o: o.price, reverse=True)
+        
+        for order in active_buys_sorted:
+            # OPTIMIZATION: Only call get_order() if:
+            # 1. Order disappeared from open_order_ids (likely filled/cancelled), OR
+            # 2. Order is at high price (48¢+) - check every cycle for fast response
+            is_high_priority = order.price >= 0.46  # 46¢+ orders checked every cycle
+            order_missing = order.order_id not in open_order_ids
             
-            # Use 'if not in open_orders' only as a trigger to CHECK status
-            if order.order_id not in open_order_ids:
-                try:
-                    # 🛡️ SAFETY CHECK: Verify it actually filled
-                    order_data = self.client.get_order(order.order_id)
+            if not (order_missing or is_high_priority):
+                continue  # Skip low-priority orders that are still open
+            
+            try:
+                order_data = self.client.get_order(order.order_id)
+                
+                if not order_data:
+                    continue
+                
+                size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
+                status = order_data.get("status", "").upper()
+                
+                # Process any NEW fills (delta from last check)
+                if size_matched > 0:
+                    delta_fill = size_matched - order.processed_size
                     
-                    # Log the raw status for debugging
-                    logger.info(f"🕵️ Checking missing order {order.order_id}: {order_data}")
-
-                    # Determine if it's truly filled (API returns snake_case 'size_matched')
-                    size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
-                    status = order_data.get("status", "").upper()
-
-                    if size_matched > 0:
-                        # Update size to actual filled amount (handles partial fills)
-                        # We use API reported original_size vs matches
+                    if delta_fill > 0.000001:  # Floating point tolerance
+                        logger.info(f"✅ BUY fill detected: +{delta_fill:.4f} shares (Total: {size_matched})")
                         
-                        # Calculate Delta
-                        delta_fill = size_matched - order.processed_size
-                        
-                        if delta_fill > 0.000001:  # Floating point tolerance
-                            logger.info(f"✅ Order fill detected: +{delta_fill:.4f} shares (Total: {size_matched})")
-                            
-                            # SAFETY: Pass delta explicitely, do NOT mutate order.size
-                            self._process_buy_fill(order, event, fill_amount=delta_fill)
-                            
-                            # Mark as processed
-                            order.processed_size = size_matched
-                        
-                        # Only mark as fully known if fully filled or cancelled (or MATCHED)
-                        api_original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
-                        
-                        if size_matched >= api_original_size or status == "CANCELLED" or status == "MATCHED":
-                            self._known_filled.add(order.order_id)
+                        # Process the fill IMMEDIATELY
+                        safe_delta = round(delta_fill, 6)
+                        self._process_buy_fill(order, event, fill_amount=safe_delta)
+                        order.processed_size = size_matched
                     
-                    elif status == "CANCELLED":
-                        logger.warning(f"⚠️ Order {order.order_id} was CANCELLED (not filled). Ignoring.")
+                    # Mark complete if fully filled
+                    api_original_size = float(order_data.get("original_size") or order_data.get("originalSize") or order.size)
+                    if size_matched >= api_original_size or status in ["MATCHED", "CANCELLED"]:
                         self._known_filled.add(order.order_id)
-                        
-                    else:
-                        logger.warning(f"⚠️ Order {order.order_id} missing from Open Orders but status is {status}. Waiting... (size_matched={size_matched})")
-                        
-                except Exception as e:
-                    logger.error(f"❌ Error verifying fill for {order.order_id}: {e}")
+                
+                elif status in ["CANCELLED", "INVALID", "EXPIRED", "REJECTED"]:
+                    # Order is dead with 0 fills - stop tracking
+                    logger.debug(f"🗑️ BUY order {order.order_id[:10]} is {status} (0 fills). Removed.")
+                    self._known_filled.add(order.order_id)
+                    
+            except Exception as e:
+                if order.order_id not in open_order_ids:
+                    logger.debug(f"Order {order.order_id[:10]} not found (likely filled): {e}")
+                else:
+                    logger.error(f"❌ Error checking order {order.order_id[:10]}: {e}")
 
         
         # Check sell orders (take-profit)
@@ -288,18 +298,14 @@ class StrategyEngine:
                         # Only mark complete if FULLY filled or explicitly done
                         if size_matched >= original_size or status == "MATCHED":
                             self._known_filled.add(order.order_id)
+                        else:
+                            # PARTIAL FILL: Log info, order stays open for remaining
+                            logger.info(f"📊 PARTIAL SELL: {size_matched}/{original_size} shares filled. Waiting...")
                     
                     elif status in ["CANCELED", "CANCELLED", "INVALID", "EXPIRED", "REJECTED"]:
                         # 🗑️ Order is dead and has 0 fills. Stop tracking it.
-                        logger.warning(f"🗑️ Order {order.order_id[:10]} is {status} with 0 fills. Removing from tracker.")
+                        logger.debug(f"🗑️ SELL order {order.order_id[:10]} is {status} (0 fills). Removed.")
                         self._known_filled.add(order.order_id)
-                        
-                    elif size_matched > 0 and size_matched < original_size:
-                         # PARTIAL FILL: Log warning, order stays open for remaining
-                         logger.warning(f"⚠️ PARTIAL SELL FILL: {size_matched}/{original_size} shares. Remaining on book.")
-                            
-                    elif status == "CANCELLED":
-                         self._known_filled.add(order.order_id)
                          
                 except Exception as e:
                     logger.error(f"❌ Error verifying sell fill for {order.order_id}: {e}")
@@ -311,6 +317,9 @@ class StrategyEngine:
         # Only for 48¢ entries: If market drops to 18¢, dump at market price
         # =========================================================================
         self._check_stop_loss(event, open_order_ids)
+        
+        # Return cached IDs for reuse in check_completion (avoids extra API call)
+        return open_order_ids
     
     def process_pending_sells(self) -> None:
         """
@@ -344,55 +353,74 @@ class StrategyEngine:
                     f"✅ PENDING SELL placed (attempt {pending['attempts']+1}): "
                     f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
                 )
+                
+                # Notify via Telegram
+                self.notifier.send_sell_placed(
+                    side_name=pending['side'].display_name,
+                    entry_price=pending['entry_price'],
+                    exit_price=pending['exit_price'],
+                    size=pending['size'],
+                    slug=slug
+                )
             else:
-                # Still failing
+                # Still failing - increment attempts
                 pending['attempts'] += 1
                 
-                # SMART RETRY LOGIC (Apply after 5 failures)
-                if pending['attempts'] >= 5:
-                    try:
-                        # Check ACTUAL token balance
-                        actual_balance = self.client.get_token_balance(pending['token_id'])
-                        
-                        if actual_balance == 0:
-                            # Settlement delay - keep waiting indefinitely
-                            # Reset attempts to 4 to keep checking but avoid "giving up"
-                            pending['attempts'] = 4
-                            logger.debug(f"⏳ Settlement delay (bal=0) for {pending['slug']}. Waiting...")
+                # SMART RETRY: Check actual balance on EVERY failed attempt (not just after 5)
+                try:
+                    actual_balance = self.client.get_token_balance(pending['token_id'])
+                    
+                    if actual_balance == 0:
+                        # Settlement delay - tokens not yet on-chain
+                        # Keep trying but cap at 60 attempts (~30s at 0.5s poll)
+                        if pending['attempts'] <= 60:
+                            logger.debug(f"⏳ Settlement delay (bal=0) for {pending['slug']}. Attempt {pending['attempts']}/60")
                             still_pending.append(pending)
-                            continue
-                            
-                        elif 0 < actual_balance < pending['size']:
-                            # PRECISION ISSUE: We have shares, but less than we sell.
-                            # Resize to match actual balance exactly.
-                            logger.warning(
-                                f"📉 Mismatched balance! Resizing {pending['size']} -> {actual_balance} "
-                                f"for {pending['slug']}"
+                        else:
+                            # After 30 seconds, something is wrong
+                            logger.error(f"❌ Settlement timeout after 60 attempts for {pending['slug']}")
+                            self.notifier.send_message(
+                                f"⚠️ ALERTA: Settlement timeout para {pending['side'].display_name}. "
+                                f"Verifica manualmente."
                             )
-                            pending['size'] = actual_balance
-                            pending['attempts'] = 0  # Reset retries for new size
+                        continue
+                        
+                    elif 0 < actual_balance < pending['size']:
+                        # FLOAT PRECISION: Actual balance is less than requested
+                        # Use the REAL balance (truncated to avoid over-selling)
+                        adjusted_size = float(int(actual_balance * 1000000)) / 1000000  # Truncate to 6 decimals
+                        logger.warning(
+                            f"📉 Float precision fix: {pending['size']:.6f} -> {adjusted_size:.6f} "
+                            f"for {pending['slug']}"
+                        )
+                        pending['size'] = adjusted_size
+                        pending['attempts'] = 0  # Reset for new size
+                        still_pending.append(pending)
+                        continue
+                        
+                    elif actual_balance >= pending['size']:
+                        # We have enough balance but order still failed - API issue
+                        if pending['attempts'] <= 10:
                             still_pending.append(pending)
-                            continue
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Error checking balance for smart retry: {e}")
-
-                if pending['attempts'] <= 10:  # Max 10 attempts for GENERIC errors
-                    still_pending.append(pending)
-                    logger.warning(
-                        f"⚠️ PENDING SELL retry failed (attempt {pending['attempts']}): "
-                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
-                    )
-                else:
-                    # Give up after 10 attempts (only for non-balance errors)
-                    logger.error(
-                        f"❌ GAVE UP on SELL after 10 attempts: "
-                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢ x{pending['size']}"
-                    )
-                    self.notifier.send_message(
-                        f"⚠️ ALERTA CRÍTICA: No se pudo colocar orden de venta después de 10 intentos. "
-                        f"Revisa manualmente: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
-                    )
+                            logger.warning(
+                                f"⚠️ SELL retry {pending['attempts']}/10 (balance OK): "
+                                f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                            )
+                        else:
+                            logger.error(
+                                f"❌ GAVE UP on SELL after 10 attempts (balance was OK): "
+                                f"{pending['side'].display_name}"
+                            )
+                            self.notifier.send_message(
+                                f"⚠️ ALERTA CRÍTICA: No se pudo colocar venta después de 10 intentos. "
+                                f"Revisa: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
+                            )
+                        continue
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error checking balance for retry: {e}")
+                    if pending['attempts'] <= 10:
+                        still_pending.append(pending)
         
         self._pending_sells = still_pending
     
@@ -441,7 +469,7 @@ class StrategyEngine:
                 try:
                     logger.info(f"🔓 Cancelling TP order {order.order_id[:8]}...")
                     self.client.cancel_order(order.order_id)
-                    time.sleep(1.0)  # Wait for cancellation
+                    # No sleep needed - cancel is synchronous
                     self._known_filled.add(order.order_id)  # Mark as handled
                 except Exception as e:
                     logger.error(f"❌ Failed to cancel TP for SL: {e}")
@@ -469,6 +497,44 @@ class StrategyEngine:
                     self.notifier.send_message(
                         f"⚠️ ALERTA: Stop-loss no se pudo ejecutar. Intervención manual requerida."
                     )
+    
+    def _flush_accumulator_for_event(self, event: EventContext) -> None:
+        """
+        Flush any accumulated shares for an event when transitioning to LIVE.
+        Even if < 5 shares, we MUST sell them to avoid holding risk during LIVE.
+        """
+        slug = event.slug
+        
+        # Find all accumulator keys for this event
+        keys_to_flush = [k for k in self._fill_accumulator.keys() if k[0] == slug]
+        
+        for acc_key in keys_to_flush:
+            acc = self._fill_accumulator[acc_key]
+            
+            if acc['size'] > 0.001:  # Only if there's meaningful size
+                _, side, token_id, exit_price = acc_key
+                sell_size = acc['size']
+                avg_entry = acc['total_entry_value'] / acc['size'] if acc['size'] > 0 else 0
+                
+                logger.warning(
+                    f"📦 FLUSH ACCUMULATOR: {sell_size:.4f} shares @ exit {int(exit_price*100)}¢ "
+                    f"(below minimum, forced sell at LIVE transition)"
+                )
+                
+                # Add to pending sells (will be processed immediately or retried)
+                pending = {
+                    'token_id': token_id,
+                    'side': side,
+                    'exit_price': exit_price,
+                    'size': sell_size,
+                    'slug': slug,
+                    'entry_price': avg_entry,
+                    'attempts': 0
+                }
+                self._pending_sells.append(pending)
+                
+                # Clear this accumulator
+                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
     
     def _process_buy_fill(self, order: TrackedOrder, event: EventContext, fill_amount: Optional[float] = None) -> None:
         """Handle a buy order fill."""
@@ -542,6 +608,15 @@ class StrategyEngine:
                 sell_order.entry_price = avg_entry
                 self._sell_orders[slug].append(sell_order)
                 logger.info(f"✅ SELL order placed: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
+                
+                # Notify via Telegram (critical for monitoring)
+                self.notifier.send_sell_placed(
+                    side_name=order.side.display_name,
+                    entry_price=avg_entry,
+                    exit_price=exit_price,
+                    size=sell_size,
+                    slug=slug
+                )
             else:
                 # Add to pending queue
                 pending = {
@@ -596,7 +671,8 @@ class StrategyEngine:
                         )
                         
                         # SAFETY: Pass delta explicitely
-                        self._process_buy_fill(order, event, fill_amount=delta_fill)
+                        safe_delta = round(delta_fill, 6)
+                        self._process_buy_fill(order, event, fill_amount=safe_delta)
                         
                         # Mark as processed
                         order.processed_size = size_matched
@@ -711,13 +787,18 @@ class StrategyEngine:
         
         # =========================================================================
         # 🛡️ RACE CONDITION AUDIT
-        # Wait 1s and check if any "cancelled" orders actually filled at the last second
+        # Check immediately if any "cancelled" orders actually filled
         # =========================================================================
         if order_ids_to_cancel:
-            logger.info(f"⏳ Waiting 1s to audit {len(order_ids_to_cancel)} cancelled orders...")
-            import time
-            time.sleep(2.0) # Brief pause to let matching engine settle
+            logger.info(f"⏳ Auditing {len(order_ids_to_cancel)} cancelled orders...")
+            # No sleep needed - API is fast enough
             self.audit_cancelled_orders(order_ids_to_cancel, event)
+        
+        # =========================================================================
+        # 📦 FLUSH ACCUMULATOR: Process any remaining accumulated shares
+        # Even if < 5 shares, we MUST sell them before event goes LIVE
+        # =========================================================================
+        self._flush_accumulator_for_event(event)
             
         self._states[slug] = StrategyState.EXITING
         
@@ -726,19 +807,26 @@ class StrategyEngine:
         
         return cancelled
     
-    def check_completion(self, event: EventContext) -> bool:
+    def check_completion(self, event: EventContext, cached_open_ids: set = None) -> bool:
         """
         Check if strategy is complete for an event.
         Complete when in EXITING state and no open sell orders.
+        
+        Args:
+            event: The event context
+            cached_open_ids: Optional set of open order IDs (avoids extra API call)
         """
         slug = event.slug
         
         if self._states.get(slug) != StrategyState.EXITING:
             return False
         
-        # Check if any sell or stop-loss orders are still open
-        open_orders = self.client.get_open_orders()
-        open_ids = {o.get("id") for o in open_orders}
+        # Use cached IDs if provided, otherwise fetch
+        if cached_open_ids is None:
+            open_orders = self.client.get_open_orders()
+            open_ids = {o.get("id") for o in open_orders}
+        else:
+            open_ids = cached_open_ids
         
         has_pending_sells = any(
             o.order_id in open_ids

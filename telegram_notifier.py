@@ -86,6 +86,18 @@ class TelegramNotifier:
         )
         return self.send_message(message)
     
+    def send_sell_placed(self, side_name: str, entry_price: float, exit_price: float, size: float, slug: str) -> bool:
+        """Notify when a SELL order is placed (critical for monitoring)."""
+        message = (
+            f"📤 *VENTA COLOCADA*\n\n"
+            f"📅 `{slug}`\n"
+            f"{side_name}\n"
+            f"💵 Entry: {int(entry_price*100)}¢ → Exit: {int(exit_price*100)}¢\n"
+            f"📦 Cantidad: {size} shares\n"
+            f"💰 Profit esperado: +{int((exit_price-entry_price)*100)}¢/share"
+        )
+        return self.send_message(message)
+    
     def send_fill(self, order: TrackedOrder, pnl: Optional[float] = None) -> bool:
         """Notify about an order fill."""
         side_str = "COMPRA" if order.order_type == OrderType.BUY else "VENTA"
