@@ -515,12 +515,15 @@ class StrategyEngine:
                             logger.debug(f"⏳ Settlement delay (bal=0) for {pending['slug']}. Attempt {pending['attempts']}/60")
                             still_pending.append(pending)
                         else:
-                            # After 30 seconds, something is wrong
-                            logger.error(f"❌ Settlement timeout after 60 attempts for {pending['slug']}")
-                            self.notifier.send_message(
-                                f"⚠️ ALERTA: Settlement timeout para {pending['side'].display_name}. "
-                                f"Verifica manualmente."
-                            )
+                            # After 30 seconds, keep trying but alert user
+                            logger.error(f"⚠️ Settlement delay >30s for {pending['slug']} (attempt {pending['attempts']})")
+                            if pending['attempts'] == 61:  # Alert only once
+                                self.notifier.send_message(
+                                    f"⚠️ Settlement delay >30s para {pending['side'].display_name}.\n"
+                                    f"El bot seguirá intentando automáticamente."
+                                )
+                            # Keep retrying - don't give up
+                            still_pending.append(pending)
                         continue
                         
                     elif 0 < available_balance < pending['size']:
@@ -552,14 +555,39 @@ class StrategyEngine:
                                 f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
                             )
                         else:
-                            logger.error(
-                                f"❌ GAVE UP on SELL after 10 attempts (avail={available_balance:.2f}): "
-                                f"{pending['side'].display_name}"
-                            )
-                            self.notifier.send_message(
-                                f"⚠️ ALERTA CRÍTICA: No se pudo colocar venta después de 10 intentos. "
-                                f"Revisa: {pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
-                            )
+                            # After 10 attempts, check if tokens exist (including locked in other sells)
+                            try:
+                                final_balance = self.client.get_token_balance(pending['token_id'])
+                                
+                                # Check if tokens are locked in OTHER sell orders
+                                open_orders = self.client.get_open_orders()
+                                locked_in_other_sells = sum(
+                                    float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
+                                    for o in open_orders
+                                    if o.get("asset_id") == pending['token_id'] 
+                                    and o.get("side", "").upper() == "SELL"
+                                )
+                                
+                                total_tokens = final_balance + locked_in_other_sells
+                                
+                                if total_tokens >= pending['size'] * 0.99:
+                                    logger.warning(
+                                        f"⚠️ 10 attempts failed but tokens exist (free={final_balance:.2f}, locked={locked_in_other_sells:.2f}). "
+                                        f"Continuing retries..."
+                                    )
+                                    still_pending.append(pending)  # Keep trying
+                                else:
+                                    logger.error(
+                                        f"💀 GAVE UP: Tokens NOT found (free={final_balance:.2f}, locked={locked_in_other_sells:.2f}, need={pending['size']:.2f})"
+                                    )
+                                    self.notifier.send_message(
+                                        f"💀 Venta abandonada después de 10 intentos:\n"
+                                        f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢\n"
+                                        f"Tokens no encontrados (libre={final_balance:.2f}, locked={locked_in_other_sells:.2f})."
+                                    )
+                            except Exception as e:
+                                logger.error(f"❌ Final balance check failed: {e}. Keeping in retry queue.")
+                                still_pending.append(pending)  # Keep trying on error
                         continue
                         
                 except Exception as e:
@@ -655,9 +683,21 @@ class StrategyEngine:
                         f"a mercado (precio cayó a {int(current_market_price*100)}¢)"
                     )
                 else:
-                    logger.error(f"❌ Failed to execute stop-loss market sell!")
+                    # Failed to place stop-loss - add to pending for retry
+                    logger.error(f"❌ Stop-loss market sell failed. Adding to retry queue...")
+                    pending = {
+                        'token_id': order.token_id,
+                        'side': order.side,
+                        'exit_price': 0.01,  # Market sell
+                        'size': order.size,
+                        'slug': slug,
+                        'entry_price': order.entry_price or 0,
+                        'attempts': 0
+                    }
+                    self._pending_sells.append(pending)
                     self.notifier.send_message(
-                        f"⚠️ ALERTA: Stop-loss no se pudo ejecutar. Intervención manual requerida."
+                        f"⚠️ STOP-LOSS: Reintentando venta a mercado.\n"
+                        f"{order.size} {order.side.display_name} (precio cayó a {int(current_market_price*100)}¢)"
                     )
     
     def _flush_accumulator_for_event(self, event: EventContext) -> None:
@@ -725,8 +765,20 @@ class StrategyEngine:
                     if available_balance < sell_size:
                         if available_balance <= 0:
                             logger.warning(
-                                f"🔒 All tokens locked in flush ({locked_in_sells:.2f} in sells). Skipping."
+                                f"⏳ Balance not available in flush (actual={actual_balance:.2f}, locked={locked_in_sells:.2f}). "
+                                f"Queuing {sell_size:.2f} shares for retry..."
                             )
+                            # Add to pending_sells and continue (don't skip!)
+                            pending = {
+                                'token_id': token_id,
+                                'side': side,
+                                'exit_price': exit_price,
+                                'size': sell_size,
+                                'slug': slug,
+                                'entry_price': avg_entry,
+                                'attempts': 0
+                            }
+                            self._pending_sells.append(pending)
                             self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                             continue
                         
@@ -825,7 +877,12 @@ class StrategyEngine:
             # The accumulator tracks exactly how many shares we need to sell for THIS fill
             sell_size = acc['size']
             
+            # Reset accumulator FIRST (we're committed to selling these shares)
+            # This prevents double-processing if we go to pending_sells
+            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+            
             # 🛡️ SAFETY: Verify we have enough available balance
+            should_queue_for_retry = False
             try:
                 actual_balance = self.client.get_token_balance(order.token_id)
                 
@@ -840,40 +897,49 @@ class StrategyEngine:
                 
                 available_balance = actual_balance - locked_in_sells
                 
-                # Only reduce sell_size if available is LESS than what we want to sell
+                # If balance not available yet, queue for retry (settlement delay or locked)
                 if available_balance < sell_size:
                     if available_balance <= 0:
                         logger.warning(
-                            f"🔒 All tokens locked in open sells ({locked_in_sells:.2f}). "
-                            f"Will retry when orders fill/cancel."
+                            f"⏳ Balance not available (actual={actual_balance:.2f}, locked={locked_in_sells:.2f}). "
+                            f"Queuing {sell_size:.2f} shares for retry..."
                         )
-                        # Don't clear accumulator - keep tracking
-                        return
-                    
-                    # Use exact available balance from Polymarket
-                    sell_size = available_balance
-                    logger.warning(
-                        f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
-                        f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
-                    )
+                        should_queue_for_retry = True
+                    else:
+                        # Use exact available balance from Polymarket
+                        sell_size = available_balance
+                        logger.warning(
+                            f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
+                            f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
+                        )
                 
                 # Validate minimum shares (6)
-                if sell_size < MIN_SHARES:
+                if not should_queue_for_retry and sell_size < MIN_SHARES:
                     logger.error(
                         f"💀 DUST: {sell_size:.2f} shares < {MIN_SHARES} min"
                     )
-                    self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                     return
                     
             except Exception as e:
-                logger.warning(f"⚠️ Balance check failed, using accumulator size: {e}")
-                sell_size = acc['size']
+                logger.warning(f"⚠️ Balance check failed, queuing for retry: {e}")
+                should_queue_for_retry = True
             
-            # Reset accumulator
-            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+            # If we need to queue for retry, add to pending_sells and exit
+            if should_queue_for_retry:
+                pending = {
+                    'token_id': order.token_id,
+                    'side': order.side,
+                    'exit_price': exit_price,
+                    'size': acc['size'],  # Use original accumulator size
+                    'slug': slug,
+                    'entry_price': avg_entry,
+                    'attempts': 0
+                }
+                self._pending_sells.append(pending)
+                logger.warning(f"⚠️ SELL queued for retry (settlement): {order.side.display_name} @ {exit_price:.2f}¢ x{acc['size']:.0f}")
+                return
             
-            # No delay - pending queue handles retries if tokens not settled
-            
+            # Try to place the sell order
             sell_order = self.client.place_limit_order(
                 token_id=order.token_id,
                 side=order.side,
