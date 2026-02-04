@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Set
 
-from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES, MIN_NOTIONAL_VALUE_USDC
+from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES, MIN_SHARES
 from models import (
     EventContext, OrderSide, OrderType, TrackedOrder,
     Position, CycleResult, StrategyState, MarketPhase
@@ -49,7 +49,7 @@ class StrategyEngine:
         # Queue for sells that failed to place (will retry each cycle)
         self._pending_sells: List[Dict] = []  # [{token_id, side, exit_price, size, slug, entry_price, attempts}]
         
-        # Accumulator for partial fills below minimum order size ($1 USDC notional)
+        # Accumulator for partial fills below minimum order size (6 shares)
         # Key: (slug, side, token_id, exit_price), Value: {size: float, total_entry_value: float}
         self._fill_accumulator: Dict[tuple, Dict] = {}
     
@@ -420,7 +420,7 @@ class StrategyEngine:
         Retry placing sell orders that failed previously.
         IMPORTANT: Call this ONCE per cycle from main.py, not per-event!
         
-        CRITICAL: Validates 1 USDC minimum notional value before retry.
+        CRITICAL: Validates minimum 6 shares before retry.
         """
         if not self._pending_sells:
             return
@@ -428,14 +428,10 @@ class StrategyEngine:
         still_pending = []
         
         for pending in self._pending_sells:
-            # ⚠️ DUST VALIDATION: Check if order meets minimum notional value
-            notional_value = pending['size'] * pending['exit_price']
-            
-            if notional_value < MIN_NOTIONAL_VALUE_USDC:
-                min_shares_needed = MIN_NOTIONAL_VALUE_USDC / pending['exit_price']
+            # ⚠️ DUST VALIDATION: Check if order meets minimum shares
+            if pending['size'] < MIN_SHARES:
                 logger.error(
-                    f"💀 DUST REJECTED: {pending['size']:.4f} shares @ {int(pending['exit_price']*100)}¢ "
-                    f"= ${notional_value:.4f} < ${MIN_NOTIONAL_VALUE_USDC}. Need {min_shares_needed:.2f} shares. "
+                    f"💀 DUST REJECTED: {pending['size']:.2f} shares < {MIN_SHARES} min. "
                     f"⚠️ Cannot sell - will expire worthless!"
                 )
                 # Don't retry, it will always fail
@@ -528,14 +524,13 @@ class StrategyEngine:
                         continue
                         
                     elif 0 < available_balance < pending['size']:
-                        # Available balance is less than requested - adjust size
-                        adjusted_size = float(int(available_balance * 1000000)) / 1000000  # Truncate to 6 decimals
+                        # Available balance is less than requested - adjust to exact balance
+                        adjusted_size = available_balance
                         
-                        # Validate minimum notional
-                        if adjusted_size * pending['exit_price'] < MIN_NOTIONAL_VALUE_USDC:
+                        # Validate minimum shares
+                        if adjusted_size < MIN_SHARES:
                             logger.error(
-                                f"💀 DUST after adjustment: {adjusted_size:.4f} shares @ {int(pending['exit_price']*100)}¢ "
-                                f"= ${adjusted_size * pending['exit_price']:.4f} < ${MIN_NOTIONAL_VALUE_USDC}"
+                                f"💀 DUST after adjustment: {adjusted_size:.2f} shares < {MIN_SHARES} min"
                             )
                             continue  # Can't sell dust
                         
@@ -686,15 +681,10 @@ class StrategyEngine:
                 sell_size = acc['size']
                 avg_entry = acc['total_entry_value'] / acc['size'] if acc['size'] > 0 else 0
                 
-                # Check if meets minimum notional value
-                notional_value = sell_size * exit_price
-                min_shares_required = MIN_NOTIONAL_VALUE_USDC / exit_price
-                
-                if notional_value < MIN_NOTIONAL_VALUE_USDC:
+                # Check if meets minimum shares
+                if sell_size < MIN_SHARES:
                     logger.error(
-                        f"💀 DUST LOCKED: {sell_size:.4f} shares @ {int(exit_price*100)}¢ "
-                        f"= ${notional_value:.4f} < ${MIN_NOTIONAL_VALUE_USDC} (API will reject). "
-                        f"Need {min_shares_required:.2f} shares minimum. "
+                        f"💀 DUST LOCKED: {sell_size:.2f} shares < {MIN_SHARES} min. "
                         f"⚠️ These shares will be LOCKED until market expiration!"
                     )
                     # Clear accumulator anyway (nothing we can do)
@@ -703,15 +693,14 @@ class StrategyEngine:
                     # Notify Telegram about locked dust
                     self.notifier.send_message(
                         f"💀 DUST LOCKED ({slug})\n"
-                        f"{side.display_name}: {sell_size:.4f} shares @ {int(exit_price*100)}¢\n"
-                        f"Value: ${notional_value:.4f} < ${MIN_NOTIONAL_VALUE_USDC} min\n"
+                        f"{side.display_name}: {sell_size:.2f} shares < {MIN_SHARES} min\n"
                         f"⚠️ Cannot sell - will expire worthless!"
                     )
                     continue  # Skip this dust, cannot sell
                 
                 logger.warning(
-                    f"📦 FLUSH ACCUMULATOR: {sell_size:.4f} shares @ exit {int(exit_price*100)}¢ "
-                    f"(${notional_value:.4f} meets ${MIN_NOTIONAL_VALUE_USDC} minimum)"
+                    f"📦 FLUSH ACCUMULATOR: {sell_size:.0f} shares @ exit {int(exit_price*100)}¢ "
+                    f"(meets {MIN_SHARES} shares minimum)"
                 )
                 
                 # ⚠️ CRITICAL: Keep sell_size from accumulator, only reduce if necessary
@@ -741,10 +730,10 @@ class StrategyEngine:
                             self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                             continue
                         
-                        sell_size = float(int(available_balance * 1000000)) / 1000000
+                        sell_size = available_balance  # Use exact balance from Polymarket
                     
-                    if sell_size * exit_price < MIN_NOTIONAL_VALUE_USDC:
-                        logger.error(f"💀 DUST in flush: ${sell_size * exit_price:.4f} < ${MIN_NOTIONAL_VALUE_USDC}")
+                    if sell_size < MIN_SHARES:
+                        logger.error(f"💀 DUST in flush: {sell_size:.2f} shares < {MIN_SHARES} min")
                         self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                         continue
                         
@@ -807,14 +796,10 @@ class StrategyEngine:
             self._results[slug].fills_no.append(entry_price)
         
         # =====================================================================
-        # POLYMARKET MINIMUM ORDER SIZE (Dynamic)
-        # API enforces: Precio × Cantidad ≥ 1 USDC (valor nocional)
-        # Ref: CLOB API error INVALID_ORDER_MIN_SIZE
+        # POLYMARKET MINIMUM ORDER SIZE: 6 shares
+        # API enforces: minimum 5 shares per order
+        # We use 6 to avoid floating point edge cases (4.999 rejected)
         # =====================================================================
-        
-        # Calculate minimum shares needed at exit price
-        # Add 1% margin to avoid rejections due to rounding
-        min_shares_required = (MIN_NOTIONAL_VALUE_USDC / exit_price) * 1.01
         
         # Accumulate fills BY EXIT PRICE to preserve the EXIT_PRICES strategy
         # Key includes exit_price so 47¢→48¢ and 48¢→49¢ entries are tracked separately
@@ -829,13 +814,11 @@ class StrategyEngine:
         
         logger.info(
             f"📦 Accumulated: {acc['size']:.0f} shares @ exit {exit_price:.2f}¢ "
-            f"(need {min_shares_required:.0f} for ${MIN_NOTIONAL_VALUE_USDC} min)"
+            f"(need {MIN_SHARES} for min)"
         )
         
         # Only place sell when we have enough shares for this specific exit price
-        # Use 99% threshold to handle partial fills
-        SELL_THRESHOLD = min_shares_required * 0.99
-        if acc['size'] >= SELL_THRESHOLD:
+        if acc['size'] >= MIN_SHARES:
             avg_entry = acc['total_entry_value'] / acc['size']
             
             # ⚠️ CRITICAL: Use accumulator size, NOT total balance!
@@ -867,18 +850,17 @@ class StrategyEngine:
                         # Don't clear accumulator - keep tracking
                         return
                     
-                    # Use available balance (truncated)
-                    sell_size = float(int(available_balance * 1000000)) / 1000000
+                    # Use exact available balance from Polymarket
+                    sell_size = available_balance
                     logger.warning(
                         f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
                         f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
                     )
                 
-                # Validate minimum notional ($1 USDC)
-                if sell_size * exit_price < MIN_NOTIONAL_VALUE_USDC:
+                # Validate minimum shares (6)
+                if sell_size < MIN_SHARES:
                     logger.error(
-                        f"💀 DUST: {sell_size:.6f} shares @ {int(exit_price*100)}¢ "
-                        f"= ${sell_size * exit_price:.4f} < ${MIN_NOTIONAL_VALUE_USDC}"
+                        f"💀 DUST: {sell_size:.2f} shares < {MIN_SHARES} min"
                     )
                     self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                     return

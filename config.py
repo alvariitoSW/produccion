@@ -67,19 +67,14 @@ ORDER_SIZE = 30.0
 # ===========================================
 # POLYMARKET ORDER LIMITS
 # ===========================================
-# CRITICAL: CLOB API enforces minimum notional value per order
-# Formula: Precio × Cantidad ≥ 1 USDC
-# Error if violated: INVALID_ORDER_MIN_SIZE
+# CRITICAL: CLOB API enforces minimum 5 shares per order
+# Error if violated: Size (X) lower than the minimum: 5
 #
-# Examples:
-#   - At 0.40¢: Need 2.5 shares minimum (0.40 × 2.5 = 1.0 USDC)
-#   - At 0.47¢: Need 2.13 shares minimum (0.47 × 2.13 ≈ 1.0 USDC)
-#   - At 0.20¢: Need 5.0 shares minimum (0.20 × 5.0 = 1.0 USDC)
+# We use 6 shares minimum to avoid floating point edge cases like 4.999
 #
-# DUST PROBLEM: Partial fills <minimum = LOCKED until expiration
-# Strategy dynamically calculates minimum per price level
+# DUST PROBLEM: Partial fills <5 shares = LOCKED until expiration
 
-MIN_NOTIONAL_VALUE_USDC = 1.0  # Hard limit from Polymarket CLOB API
+MIN_SHARES = 6  # Polymarket requires 5 shares min, we use 6 for safety
 
 # ===========================================
 # TIMING (Optimized for Polymarket CLOB API limits)
