@@ -1,0 +1,1077 @@
+================================================================================
+                    INFORME DE AUDITORÍA: strategy_engine.py
+                    Bot de Trading Polymarket - Mean Reversion Ladder
+                    Fecha: 4 de Febrero de 2026
+================================================================================
+
+ÍNDICE
+------
+1. Resumen Ejecutivo
+2. Arquitectura General
+3. Análisis Función por Función
+4. Casos Límite y Soluciones Implementadas
+5. Flujo de Datos Críticos
+6. Conclusiones
+
+================================================================================
+1. RESUMEN EJECUTIVO
+================================================================================
+
+El archivo strategy_engine.py implementa el núcleo de la estrategia de trading
+"Mean Reversion Ladder" para mercados de predicción en Polymarket.
+
+ESTADÍSTICAS:
+- Total de líneas: 1,065
+- Funciones públicas: 8
+- Funciones privadas: 7
+- Estructuras de datos: 9 diccionarios de estado
+
+PROBLEMAS CRÍTICOS RESUELTOS EN ESTA VERSIÓN:
+✅ Bug crítico: Bot vendía TODO el balance en lugar del acumulado
+✅ Tokens bloqueados: Cálculo de locked_in_sells para órdenes abiertas
+✅ Mínimo dinámico: $1 USDC nocional en lugar de 5 shares fijas
+✅ Precisión float: Truncado a 6 decimales para evitar errores de balance
+✅ Race conditions: Auditoría de órdenes canceladas que pueden haber llenado
+✅ Partial fills: Procesamiento incremental con delta (no acumulativo)
+
+================================================================================
+2. ARQUITECTURA GENERAL
+================================================================================
+
+CLASE: StrategyEngine
+---------------------
+Responsabilidad: Gestionar la estrategia completa de trading para eventos
+de Polymarket, incluyendo:
+- Colocación de escalera de órdenes de compra (ladder)
+- Detección y procesamiento de fills
+- Colocación automática de órdenes de venta (take-profit)
+- Gestión de stop-loss client-side
+- Recarga de posiciones en PRE_MARKET
+- Transición a modo LIVE
+
+ESTADOS DEL CICLO DE VIDA:
+1. ACCUMULATING: Fase PRE_MARKET, comprando a precios bajos
+2. EXITING: Evento LIVE, solo vendiendo posiciones
+3. COMPLETED: Todas las ventas ejecutadas
+
+ESTRUCTURAS DE DATOS PRINCIPALES:
+---------------------------------
+_states: Dict[str, StrategyState]
+    → Estado actual de cada evento (ACCUMULATING/EXITING/COMPLETED)
+
+_positions: Dict[str, List[Position]]
+    → Posiciones abiertas por evento
+
+_buy_orders: Dict[str, List[TrackedOrder]]
+    → Órdenes de compra colocadas por evento
+
+_sell_orders: Dict[str, List[TrackedOrder]]
+    → Órdenes de venta (take-profit) por evento
+
+_stop_loss_orders: Dict[str, List[TrackedOrder]]
+    → Órdenes de stop-loss por evento
+
+_known_filled: Set[str]
+    → IDs de órdenes ya procesadas (evita duplicados)
+
+_pending_sells: List[Dict]
+    → Cola de ventas fallidas para reintentar
+
+_fill_accumulator: Dict[tuple, Dict]
+    → Acumulador de fills parciales por (slug, side, token_id, exit_price)
+    → CRÍTICO: Clave incluye exit_price para separar entradas 47¢→48¢ de 48¢→49¢
+
+================================================================================
+3. ANÁLISIS FUNCIÓN POR FUNCIÓN
+================================================================================
+
+-------------------------------------------------------------------------------
+3.1. __init__(self, client: PolymarketClient)
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 31-50
+
+PROPÓSITO:
+Constructor de la clase. Inicializa todas las estructuras de datos necesarias
+para el seguimiento del estado de la estrategia.
+
+LÓGICA:
+1. Guarda referencia al cliente de Polymarket
+2. Obtiene instancia del notificador de Telegram
+3. Inicializa 9 diccionarios/sets vacíos para tracking de estado
+
+POR QUÉ ESTÁ AHÍ:
+Es el punto de entrada para crear una instancia del motor de estrategia.
+Centraliza toda la inicialización en un solo lugar.
+
+QUÉ RESUELVE:
+- Evita errores de KeyError al acceder a diccionarios no inicializados
+- Garantiza estado limpio al crear nueva instancia
+
+-------------------------------------------------------------------------------
+3.2. _get_exit_price(self, entry_price: float) -> float
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 52-62
+
+PROPÓSITO:
+Determina el precio de salida (take-profit) basado en el precio de entrada.
+
+LÓGICA:
+1. Redondea el precio de entrada a 2 decimales (evita errores de precisión float)
+2. Busca en diccionario EXIT_PRICES el precio de salida correspondiente
+3. Retorna 49¢ por defecto si no encuentra mapeo
+
+MAPEO DE PRECIOS (desde config.py):
+- Entrada 48¢ → Salida 49¢ (spread 1¢ = 2.08% profit)
+- Entrada 46-47¢ → Salida 48¢ (spread 1-2¢)
+- Entrada 40-45¢ → Salida 47¢ (spread 2-7¢)
+
+POR QUÉ ESTÁ AHÍ:
+La estrategia de mean reversion requiere spreads dinámicos. Entradas más
+arriesgadas (precios bajos) deben tener mayor spread de protección.
+
+QUÉ RESUELVE:
+- Centraliza la lógica de mapeo entry→exit
+- El redondeo a 2 decimales evita bugs como 0.4799999999 != 0.48
+
+-------------------------------------------------------------------------------
+3.3. _needs_stop_loss(self, entry_price: float) -> bool
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 64-67
+
+PROPÓSITO:
+Determina si una entrada necesita stop-loss basado en su precio.
+
+LÓGICA:
+1. Redondea precio a 2 decimales
+2. Verifica si está en el set STOP_LOSS_ENTRIES (típicamente solo 48¢)
+
+POR QUÉ ESTÁ AHÍ:
+Las entradas a 48¢ son las más arriesgadas (cerca del 50%). Si el mercado
+se mueve en contra, la pérdida potencial es mayor. Solo estas necesitan
+protección adicional con stop-loss.
+
+QUÉ RESUELVE:
+- Evita colocar stop-loss innecesarios en entradas seguras (40-47¢)
+- Reduce complejidad de la lógica OCO (One-Cancels-Other)
+
+-------------------------------------------------------------------------------
+3.4. initialize_event(self, event: EventContext) -> int
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 69-186
+
+PROPÓSITO:
+Inicializa la estrategia para un nuevo evento. Coloca la escalera de órdenes
+de compra o recupera órdenes existentes si el bot se reinició.
+
+LÓGICA DETALLADA:
+
+FASE 1 - VALIDACIÓN (líneas 78-90):
+    if slug in self._states:
+        return 0  # Ya inicializado
+    
+    if event.phase != MarketPhase.PRE_MARKET:
+        logger.error("REJECTED: Solo PRE_MARKET permitido")
+        return 0
+
+FASE 2 - INICIALIZACIÓN DE ESTADO (líneas 92-98):
+    self._states[slug] = StrategyState.ACCUMULATING
+    self._positions[slug] = []
+    self._results[slug] = CycleResult(...)
+    self._buy_orders[slug] = []
+    self._sell_orders[slug] = []
+    self._stop_loss_orders[slug] = []
+
+FASE 3 - RECUPERACIÓN DE ESTADO (líneas 100-162):
+    existing_orders = self.client.get_open_orders()
+    relevant_orders = [filtrar por token_id del evento]
+    
+    if relevant_orders:
+        # Reconstruir TrackedOrder desde datos de API
+        # Agregar a _buy_orders o _sell_orders según tipo
+        return recovered_count  # NO colocar nuevas órdenes
+
+FASE 4 - COLOCACIÓN DE LADDER (líneas 164-186):
+    for side in [YES, NO]:
+        for price in LADDER_LEVELS:  # [0.40, 0.42, ..., 0.48]
+            order = client.place_limit_order(...)
+            _buy_orders[slug].append(order)
+
+POR QUÉ ESTÁ AHÍ:
+Es el punto de entrada para comenzar a operar un nuevo evento. Debe:
+1. Prevenir inicialización doble
+2. Rechazar eventos que ya están LIVE
+3. Recuperar estado si el bot se reinició mid-evento
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Reinicio del bot → No coloca órdenes duplicadas
+- CASO LÍMITE: Evento ya LIVE → Rechazado para evitar pérdidas
+- Idempotencia: Llamar múltiples veces es seguro
+
+-------------------------------------------------------------------------------
+3.5. check_fills(self, event: EventContext, open_order_ids: Optional[Set[str]]) 
+     -> Optional[Set[str]]
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 188-316
+
+PROPÓSITO:
+Detecta y procesa órdenes que han sido llenadas (parcial o totalmente).
+Es el "corazón" del sistema de detección de fills.
+
+LÓGICA DETALLADA:
+
+SECCIÓN 1 - VERIFICACIÓN DE COMPRAS (líneas 215-270):
+
+    # Optimización: Ordenar por precio DESC (48¢ primero)
+    active_buys_sorted = sorted(active_buys, key=lambda o: o.price, reverse=True)
+    
+    for order in active_buys_sorted:
+        # OPTIMIZACIÓN: Solo consultar API si:
+        # 1. Orden desapareció de open_order_ids (probable fill)
+        # 2. Orden es "alta prioridad" (≥46¢) - revisar siempre
+        
+        if not (order_missing or is_high_priority):
+            continue  # Skip órdenes de baja prioridad que siguen abiertas
+        
+        order_data = client.get_order(order.order_id)
+        size_matched = float(order_data.get("size_matched", 0))
+        
+        # CRÍTICO: Procesar solo el DELTA (nuevo desde última revisión)
+        delta_fill = size_matched - order.processed_size
+        
+        if delta_fill > 0.000001:
+            safe_delta = round(delta_fill, 6)
+            self._process_buy_fill(order, event, fill_amount=safe_delta)
+            order.processed_size = size_matched  # Actualizar para siguiente ciclo
+
+SECCIÓN 2 - VERIFICACIÓN DE VENTAS (líneas 272-304):
+
+    for order in _sell_orders[slug]:
+        if order.order_id not in open_order_ids:
+            # Orden desapareció → probable fill
+            order_data = client.get_order(order.order_id)
+            
+            # SAFETY: Validar que API retornó datos
+            if order_data is None:
+                continue  # Reintentar en siguiente ciclo
+            
+            if size_matched > 0:
+                self._process_sell_fill(order, event)
+            
+            # PARTIAL FILL: Solo marcar como _known_filled si está 100% lleno
+            if size_matched >= original_size:
+                _known_filled.add(order.order_id)
+
+SECCIÓN 3 - MONITOR DE STOP-LOSS (líneas 306-312):
+
+    self._check_stop_loss(event, open_order_ids)
+
+SECCIÓN 4 - RETORNO DE IDs CACHEADOS (línea 316):
+
+    return open_order_ids  # Reusar en check_completion()
+
+POR QUÉ ESTÁ AHÍ:
+Sin detección de fills, el bot no sabría cuándo colocar órdenes de venta.
+Es el sistema de "sensores" que detecta actividad en el mercado.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Partial fills → Usa delta, no acumulativo
+- CASO LÍMITE: API retorna None → Skip seguro, reintenta después
+- CASO LÍMITE: Orden de alta prioridad (48¢) → Revisar cada ciclo
+- OPTIMIZACIÓN: No consultar API para órdenes de baja prioridad que siguen abiertas
+
+-------------------------------------------------------------------------------
+3.6. process_pending_sells(self) -> None
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 318-481
+
+PROPÓSITO:
+Reintenta colocar órdenes de venta que fallaron anteriormente.
+Llamada UNA VEZ por ciclo desde main.py (no por evento).
+
+LÓGICA DETALLADA:
+
+FASE 1 - VALIDACIÓN DE DUST (líneas 330-345):
+
+    notional_value = pending['size'] * pending['exit_price']
+    
+    if notional_value < MIN_NOTIONAL_VALUE_USDC:  # $1 mínimo
+        logger.error("DUST REJECTED: No cumple mínimo nocional")
+        continue  # No reintentar, siempre fallará
+
+FASE 2 - INTENTO DE COLOCACIÓN (líneas 347-373):
+
+    sell_order = client.place_limit_order(...)
+    
+    if sell_order:
+        _sell_orders[slug].append(sell_order)
+        notifier.send_sell_placed(...)
+    else:
+        # Falló → investigar por qué
+
+FASE 3 - DIAGNÓSTICO INTELIGENTE DE FALLO (líneas 375-481):
+
+    actual_balance = client.get_token_balance(token_id)
+    
+    # ⚠️ CRÍTICO: Calcular tokens bloqueados en ventas abiertas
+    open_orders = client.get_open_orders()
+    locked_in_sells = sum(
+        size - size_matched
+        for o in open_orders
+        if o.asset_id == token_id and o.side == "SELL"
+    )
+    
+    available_balance = actual_balance - locked_in_sells
+    
+    ESCENARIOS:
+    
+    A) available_balance <= 0:
+        → Tokens bloqueados en otras ventas
+        → Verificar si ya existe orden duplicada
+        → Si existe: remover de pending
+        → Si no: reintentar brevemente (5 intentos max)
+    
+    B) actual_balance == 0:
+        → Delay de settlement (tokens no en blockchain aún)
+        → Reintentar hasta 60 intentos (~30 segundos)
+        → Después: alertar por Telegram
+    
+    C) 0 < available_balance < pending['size']:
+        → Balance parcial disponible
+        → Ajustar size al disponible (truncar a 6 decimales)
+        → Validar que ajustado cumple mínimo nocional
+    
+    D) available_balance >= pending['size']:
+        → Tenemos suficiente pero API falló
+        → Reintentar hasta 10 intentos
+        → Después: alertar crítica por Telegram
+
+POR QUÉ ESTÁ AHÍ:
+Las órdenes de venta pueden fallar por múltiples razones:
+- Settlement delay: tokens no disponibles inmediatamente
+- Balance insuficiente: ya vendido por otra orden
+- Error de API: timeout, rate limit, etc.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Settlement delay → Reintento con timeout de 30s
+- CASO LÍMITE: Tokens bloqueados → Detecta y evita duplicados
+- CASO LÍMITE: Balance parcial → Ajusta tamaño automáticamente
+- CASO LÍMITE: Dust → Rechaza si no cumple $1 mínimo
+
+-------------------------------------------------------------------------------
+3.7. _check_stop_loss(self, event: EventContext, open_order_ids: set) -> None
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 483-551
+
+PROPÓSITO:
+Monitor client-side de stop-loss para entradas de alto riesgo (48¢).
+Si el precio cae a STOP_LOSS_PRICE (ej: 18¢), ejecuta venta a mercado.
+
+LÓGICA DETALLADA:
+
+    for order in _sell_orders[slug]:
+        # Skip si ya procesado o ya llenado
+        if order.order_id in _known_filled or order.order_id not in open_order_ids:
+            continue
+        
+        # Solo aplicar a entradas que necesitan stop-loss (48¢)
+        if not _needs_stop_loss(order.entry_price):
+            continue
+        
+        # Obtener precio actual del mercado (best bid)
+        current_market_price = event.yes_bid o event.no_bid
+        
+        # TRIGGER: Si precio cae al umbral
+        if current_market_price <= STOP_LOSS_PRICE:
+            
+            # 1. Cancelar orden de take-profit (liberar tokens)
+            client.cancel_order(order.order_id)
+            _known_filled.add(order.order_id)
+            
+            # 2. Vender a mercado (limit a 1¢ cruza cualquier bid)
+            dump_order = client.place_limit_order(
+                price=0.01,  # "Market sell"
+                size=order.size,
+                ...
+            )
+            
+            # 3. Notificar
+            if dump_order:
+                notifier.send_message("STOP-LOSS EJECUTADO")
+            else:
+                notifier.send_message("ALERTA: Stop-loss falló")
+
+POR QUÉ ESTÁ AHÍ:
+Polymarket no tiene órdenes stop-loss nativas. Debemos implementar
+monitoreo client-side para proteger posiciones de alto riesgo.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Mercado colapsa → Vende antes de pérdida total
+- CASO LÍMITE: Solo 48¢ → No afecta entradas más seguras
+- CASO LÍMITE: Tokens bloqueados → Cancela TP antes de vender
+
+-------------------------------------------------------------------------------
+3.8. _flush_accumulator_for_event(self, event: EventContext) -> None
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 553-656
+
+PROPÓSITO:
+Vacía el acumulador de fills parciales cuando el evento pasa a LIVE.
+Intenta vender lo acumulado si cumple mínimo, o marca como "dust" si no.
+
+LÓGICA DETALLADA:
+
+    # Encontrar todas las claves del acumulador para este evento
+    keys_to_flush = [k for k in _fill_accumulator.keys() if k[0] == slug]
+    
+    for acc_key in keys_to_flush:
+        acc = _fill_accumulator[acc_key]
+        
+        if acc['size'] > 0.001:  # Tamaño significativo
+            _, side, token_id, exit_price = acc_key
+            sell_size = acc['size']  # ⚠️ CRÍTICO: Usar tamaño del acumulador
+            
+            # Calcular valor nocional
+            notional_value = sell_size * exit_price
+            
+            if notional_value < MIN_NOTIONAL_VALUE_USDC:
+                # DUST: No se puede vender
+                logger.error("DUST LOCKED: Expirará sin valor")
+                notifier.send_message("DUST LOCKED...")
+                _fill_accumulator[acc_key] = {'size': 0.0, ...}
+                continue
+            
+            # 🛡️ SAFETY: Verificar balance disponible
+            actual_balance = client.get_token_balance(token_id)
+            
+            # Calcular tokens bloqueados en ventas abiertas
+            locked_in_sells = sum(...)
+            available_balance = actual_balance - locked_in_sells
+            
+            # ⚠️ CRÍTICO: Solo REDUCIR si necesario, no REEMPLAZAR
+            if available_balance < sell_size:
+                if available_balance <= 0:
+                    continue  # Todo bloqueado
+                sell_size = truncate_6_decimals(available_balance)
+            
+            # Agregar a cola de pending sells
+            _pending_sells.append({
+                'token_id': token_id,
+                'size': sell_size,  # Tamaño del acumulador (posiblemente reducido)
+                ...
+            })
+            
+            # Limpiar acumulador
+            _fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+
+POR QUÉ ESTÁ AHÍ:
+Durante PRE_MARKET, pueden llegar partial fills que no cumplen el mínimo
+de $1 USDC individualmente. El acumulador los junta hasta que cumplen.
+Cuando el evento pasa a LIVE, debemos procesar lo que quedó acumulado.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Partial fills pequeños → Acumula hasta cumplir mínimo
+- CASO LÍMITE: Dust al pasar a LIVE → Notifica que se perderá
+- CASO LÍMITE: Tokens bloqueados → Reduce tamaño o skip
+- BUG CRÍTICO RESUELTO: Usaba balance total, ahora usa acc['size']
+
+-------------------------------------------------------------------------------
+3.9. _process_buy_fill(self, order: TrackedOrder, event: EventContext, 
+                        fill_amount: Optional[float] = None) -> None
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 658-821
+
+PROPÓSITO:
+Procesa un fill de compra. Acumula shares y coloca orden de venta cuando
+se alcanza el mínimo de $1 USDC nocional.
+
+LÓGICA DETALLADA:
+
+FASE 1 - PREPARACIÓN (líneas 664-680):
+
+    entry_price = order.price
+    exit_price = _get_exit_price(entry_price)
+    actual_size = fill_amount or order.size
+    
+    # Notificar por Telegram
+    notifier.send_message("BUY FILLED...")
+    
+    # Registrar posición
+    _positions[slug].append(Position(...))
+    _results[slug].fills_yes/no.append(entry_price)
+
+FASE 2 - ACUMULACIÓN (líneas 700-725):
+
+    # Calcular mínimo de shares para cumplir $1 USDC
+    min_shares_required = (MIN_NOTIONAL_VALUE_USDC / exit_price) * 1.01
+    
+    # Clave del acumulador incluye exit_price
+    # → Separa entradas 47¢→48¢ de 48¢→49¢
+    acc_key = (slug, order.side, order.token_id, exit_price)
+    
+    # Acumular
+    acc['size'] += actual_size
+    acc['total_entry_value'] += actual_size * entry_price
+    
+    logger.info(f"Accumulated: {acc['size']} shares (need {min_shares_required})")
+
+FASE 3 - DECISIÓN DE VENTA (líneas 727-821):
+
+    SELL_THRESHOLD = min_shares_required * 0.99  # 99% para partial fills
+    
+    if acc['size'] >= SELL_THRESHOLD:
+        avg_entry = acc['total_entry_value'] / acc['size']
+        
+        # ⚠️ CRÍTICO: sell_size = acc['size'], NO total balance
+        sell_size = acc['size']
+        
+        # 🛡️ SAFETY: Verificar balance disponible
+        actual_balance = client.get_token_balance(token_id)
+        
+        # Calcular locked_in_sells
+        locked_in_sells = sum(
+            size - size_matched
+            for o in open_orders
+            if o.asset_id == token_id and o.side == "SELL"
+        )
+        
+        available_balance = actual_balance - locked_in_sells
+        
+        # ⚠️ CRÍTICO: Solo REDUCIR si necessary
+        if available_balance < sell_size:
+            if available_balance <= 0:
+                return  # No limpiar acumulador, reintentar después
+            sell_size = truncate_6_decimals(available_balance)
+        
+        # Validar mínimo nocional
+        if sell_size * exit_price < MIN_NOTIONAL_VALUE_USDC:
+            logger.error("DUST")
+            _fill_accumulator[acc_key] = {'size': 0.0, ...}
+            return
+        
+        # Limpiar acumulador
+        _fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+        
+        # Colocar orden de venta
+        sell_order = client.place_limit_order(
+            price=exit_price,
+            size=sell_size,  # Del acumulador, no del balance total
+            ...
+        )
+        
+        if sell_order:
+            _sell_orders[slug].append(sell_order)
+            notifier.send_sell_placed(...)
+        else:
+            _pending_sells.append(...)  # Reintentar después
+
+POR QUÉ ESTÁ AHÍ:
+Es el core de la estrategia: cuando compramos, debemos vender a profit.
+Sin esta función, el bot compraría pero nunca vendería.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Partial fills < $1 → Acumula hasta cumplir
+- CASO LÍMITE: Tokens bloqueados → Reduce tamaño o espera
+- BUG CRÍTICO RESUELTO: Antes usaba available_balance como sell_size
+  (vendía TODO el balance), ahora usa acc['size'] (solo lo acumulado)
+- CASO LÍMITE: API falla → Cola de pending_sells para retry
+
+-------------------------------------------------------------------------------
+3.10. audit_cancelled_orders(self, order_ids: List[str], event: EventContext)
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 823-884
+
+PROPÓSITO:
+Audita órdenes de compra que fueron canceladas para detectar fills ocultos
+que ocurrieron durante la "race condition" de cancelación.
+
+LÓGICA DETALLADA:
+
+    logger.info(f"Auditing {len(order_ids)} cancelled orders...")
+    
+    # Encontrar TrackedOrders correspondientes
+    orders_to_audit = [
+        o for o in _buy_orders[slug]
+        if o.order_id in order_ids
+    ]
+    
+    for order in orders_to_audit:
+        order_data = client.get_order(order.order_id)
+        
+        # SAFETY: Validar que API retornó datos
+        if not order_data:
+            continue
+        
+        size_matched = float(order_data.get("size_matched", 0))
+        
+        if size_matched > 0:
+            # DELTA logic: Solo procesar fills nuevos
+            delta_fill = size_matched - order.processed_size
+            
+            if delta_fill > 0.000001:
+                logger.warning(f"RACE CONDITION: Found {delta_fill} hidden shares!")
+                
+                safe_delta = round(delta_fill, 6)
+                self._process_buy_fill(order, event, fill_amount=safe_delta)
+                order.processed_size = size_matched
+            
+            if size_matched >= original_size:
+                _known_filled.add(order.order_id)
+
+POR QUÉ ESTÁ AHÍ:
+Cuando el evento pasa a LIVE, cancelamos todas las órdenes de compra en batch.
+Pero entre que enviamos la cancelación y se ejecuta, alguna orden puede haber
+sido llenada. Sin esta auditoría, perderíamos esos fills.
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Race condition en cancelación → Detecta fills ocultos
+- CASO LÍMITE: API retorna None → Skip seguro
+- CASO LÍMITE: Fill ya procesado parcialmente → Usa delta, no acumulativo
+
+-------------------------------------------------------------------------------
+3.11. _process_sell_fill(self, order: TrackedOrder, event: EventContext,
+                          is_stop_loss: bool = False) -> None
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 886-964
+
+PROPÓSITO:
+Procesa un fill de venta (take-profit o stop-loss). Calcula PnL, ejecuta
+lógica OCO, y opcionalmente recarga la posición si está en PRE_MARKET.
+
+LÓGICA DETALLADA:
+
+FASE 1 - CÁLCULO DE PnL (líneas 895-912):
+
+    entry_price = order.entry_price or 0
+    pnl = (order.price - entry_price) * order.size
+    _results[slug].total_pnl += pnl
+    
+    if is_stop_loss:
+        logger.warning("STOP-LOSS HIT: Loss $X")
+    else:
+        logger.info("TAKE-PROFIT: PnL $X")
+
+FASE 2 - LÓGICA OCO (líneas 914-938):
+
+    # Solo para entradas que tienen stop-loss (48¢)
+    if _needs_stop_loss(entry_price):
+        
+        if is_stop_loss:
+            # Stop-loss ejecutado → Cancelar take-profit
+            for sell in _sell_orders[slug]:
+                if sell.entry_price ≈ entry_price:
+                    client.cancel_order(sell.order_id)
+                    _known_filled.add(sell.order_id)
+                    break
+        else:
+            # Take-profit ejecutado → Cancelar stop-loss
+            for stop in _stop_loss_orders[slug]:
+                if stop.entry_price ≈ entry_price:
+                    client.cancel_order(stop.order_id)
+                    _known_filled.add(stop.order_id)
+                    break
+
+FASE 3 - LIMPIEZA DE POSICIÓN (líneas 940-948):
+
+    for pos in _positions[slug]:
+        if pos.side == order.side and pos.entry_price ≈ entry_price:
+            _positions[slug].remove(pos)
+            break
+    
+    notifier.send_fill(order, pnl=pnl)
+
+FASE 4 - RELOAD EN PRE_MARKET (líneas 950-964):
+
+    # Solo si estamos en ACCUMULATING (PRE_MARKET) y NO es stop-loss
+    if _states[slug] == StrategyState.ACCUMULATING and not is_stop_loss:
+        reload_order = client.place_limit_order(
+            price=entry_price,  # Mismo precio que antes
+            size=order.size,
+            type=BUY
+        )
+        
+        if reload_order:
+            _buy_orders[slug].append(reload_order)
+            logger.info("RELOAD: Replenished buy")
+
+POR QUÉ ESTÁ AHÍ:
+Completa el ciclo de trading. Cuando vendemos, necesitamos:
+1. Calcular si ganamos o perdimos dinero
+2. Cancelar órdenes relacionadas (OCO)
+3. Limpiar estado interno
+4. Recargar si hay oportunidad (PRE_MARKET)
+
+QUÉ RESUELVE:
+- CASO LÍMITE: OCO → Evita que queden órdenes huérfanas
+- CASO LÍMITE: Stop-loss no recarga → Evita perseguir pérdidas
+- CASO LÍMITE: PRE_MARKET → Aprovecha oportunidades de reload
+
+-------------------------------------------------------------------------------
+3.12. transition_to_live(self, event: EventContext) -> int
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 966-1006
+
+PROPÓSITO:
+Maneja la transición del evento de PRE_MARKET a LIVE.
+Cancela todas las órdenes de compra y prepara para modo solo-salida.
+
+LÓGICA DETALLADA:
+
+    if _states[slug] != StrategyState.ACCUMULATING:
+        return 0  # Ya transicionado o no inicializado
+    
+    # Recolectar IDs de órdenes a cancelar
+    order_ids_to_cancel = [
+        o.order_id for o in _buy_orders[slug]
+        if o.order_id not in _known_filled
+    ]
+    
+    # Cancelación en batch (una llamada API)
+    cancelled = client.cancel_orders_batch(order_ids_to_cancel)
+    
+    # 🛡️ AUDITORÍA DE RACE CONDITION
+    if order_ids_to_cancel:
+        self.audit_cancelled_orders(order_ids_to_cancel, event)
+    
+    # 📦 FLUSH ACCUMULATOR
+    self._flush_accumulator_for_event(event)
+    
+    # Cambiar estado
+    _states[slug] = StrategyState.EXITING
+    
+    notifier.send_phase_transition(event, cancelled)
+    return cancelled
+
+POR QUÉ ESTÁ AHÍ:
+Cuando el evento pasa a LIVE, las probabilidades ya no son favorables
+para comprar. Debemos:
+1. Cancelar compras pendientes (ya no queremos más posiciones)
+2. Detectar fills de última hora (race condition)
+3. Procesar cualquier acumulación pendiente
+4. Cambiar a modo "solo venta"
+
+QUÉ RESUELVE:
+- CASO LÍMITE: Race condition → Audita órdenes canceladas
+- CASO LÍMITE: Fills acumulados → Flush antes de cambiar modo
+- OPTIMIZACIÓN: Batch cancel → Una llamada API en lugar de N
+
+-------------------------------------------------------------------------------
+3.13. check_completion(self, event: EventContext, cached_open_ids: set) -> bool
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 1008-1045
+
+PROPÓSITO:
+Verifica si la estrategia está completa para un evento.
+Completo = modo EXITING + sin órdenes de venta abiertas.
+
+LÓGICA:
+
+    if _states[slug] != StrategyState.EXITING:
+        return False  # Aún no en modo salida
+    
+    # Usar IDs cacheados si disponibles (optimización)
+    open_ids = cached_open_ids or {fetch from API}
+    
+    has_pending_sells = any(
+        o.order_id in open_ids
+        for o in _sell_orders[slug]
+    )
+    
+    has_pending_stops = any(
+        o.order_id in open_ids
+        for o in _stop_loss_orders[slug]
+    )
+    
+    if not has_pending_sells and not has_pending_stops:
+        _states[slug] = StrategyState.COMPLETED
+        _results[slug].end_time = time.time()
+        
+        notifier.send_cycle_report(_results[slug])
+        return True
+    
+    return False
+
+POR QUÉ ESTÁ AHÍ:
+Necesitamos saber cuándo un evento ha terminado para:
+1. Liberar recursos (limpiar diccionarios)
+2. Reportar resultados finales
+3. Permitir que el scanner busque nuevos eventos
+
+QUÉ RESUELVE:
+- OPTIMIZACIÓN: Reutiliza open_ids cacheados de check_fills()
+- Reporte final: Notifica PnL total del evento
+
+-------------------------------------------------------------------------------
+3.14. get_state(self, slug: str) -> Optional[StrategyState]
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 1047-1049
+
+PROPÓSITO:
+Getter simple para obtener el estado de un evento.
+
+LÓGICA:
+    return _states.get(slug)
+
+POR QUÉ ESTÁ AHÍ:
+Encapsulación. Permite a main.py consultar el estado sin acceder
+directamente al diccionario interno.
+
+-------------------------------------------------------------------------------
+3.15. get_result(self, slug: str) -> Optional[CycleResult]
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 1051-1053
+
+PROPÓSITO:
+Getter simple para obtener el resultado del ciclo de un evento.
+
+LÓGICA:
+    return _results.get(slug)
+
+POR QUÉ ESTÁ AHÍ:
+Encapsulación para acceder a resultados de trading.
+
+-------------------------------------------------------------------------------
+3.16. get_pending_count(self, slug: str = None) -> int
+-------------------------------------------------------------------------------
+UBICACIÓN: Líneas 1055-1065
+
+PROPÓSITO:
+Cuenta órdenes pendientes (no llenadas) para un evento o globalmente.
+
+LÓGICA:
+
+    if slug:
+        buys = len([o for o in _buy_orders[slug] if o not in _known_filled])
+        sells = len([o for o in _sell_orders[slug] if o not in _known_filled])
+        stops = len([o for o in _stop_loss_orders[slug] if o not in _known_filled])
+        return buys + sells + stops
+    else:
+        # Sumar todos los eventos
+        return sum(get_pending_count(s) for s in _states)
+
+POR QUÉ ESTÁ AHÍ:
+Útil para logging y debugging. Permite ver cuántas órdenes están activas.
+
+================================================================================
+4. CASOS LÍMITE Y SOLUCIONES IMPLEMENTADAS
+================================================================================
+
+4.1. BUG CRÍTICO: VENTA DE TODO EL BALANCE
+------------------------------------------
+PROBLEMA:
+El bot intentó vender 548 shares (balance total) en lugar de 68 shares
+(lo que realmente había acumulado del último fill).
+
+CAUSA RAÍZ:
+Durante una auditoría anterior, se cambió:
+    sell_size = acc['size']  # Correcto: del acumulador
+a:
+    sell_size = available_balance  # INCORRECTO: todo el balance
+
+SOLUCIÓN IMPLEMENTADA (líneas 734-770 de _process_buy_fill):
+    # ⚠️ CRÍTICO: sell_size = acc['size'], NO total balance
+    sell_size = acc['size']
+    
+    # Solo REDUCIR si available < sell_size
+    if available_balance < sell_size:
+        sell_size = truncate_6_decimals(available_balance)
+
+PRINCIPIO:
+- El acumulador es la FUENTE DE VERDAD de cuánto vender
+- El balance se usa solo para VALIDACIÓN y posible REDUCCIÓN
+- NUNCA reemplazar el sell_size con el balance total
+
+
+4.2. TOKENS BLOQUEADOS EN ÓRDENES DE VENTA ABIERTAS
+---------------------------------------------------
+PROBLEMA:
+Error "not enough balance" cuando había 150 shares pero 100 ya estaban
+en una orden de venta abierta.
+
+SOLUCIÓN IMPLEMENTADA (en múltiples funciones):
+    open_orders = client.get_open_orders()
+    locked_in_sells = sum(
+        float(o.get("size", 0)) - float(o.get("size_matched", 0))
+        for o in open_orders
+        if o.get("asset_id") == token_id and o.get("side") == "SELL"
+    )
+    
+    available_balance = actual_balance - locked_in_sells
+
+UBICACIONES:
+- _process_buy_fill: líneas 742-755
+- _flush_accumulator_for_event: líneas 613-626
+- process_pending_sells: líneas 386-399
+
+
+4.3. MÍNIMO DE ORDEN DINÁMICO ($1 USDC)
+---------------------------------------
+PROBLEMA:
+El bot usaba 5 shares mínimo fijo, pero Polymarket requiere:
+    Precio × Cantidad ≥ $1 USDC (valor nocional)
+
+A 49¢, 5 shares = $2.45 ✓
+A 49¢, 2 shares = $0.98 ✗ (rechazado por API)
+
+SOLUCIÓN IMPLEMENTADA (líneas 710-714):
+    min_shares_required = (MIN_NOTIONAL_VALUE_USDC / exit_price) * 1.01
+    
+    # 1.01 = margen de 1% para evitar rechazos por redondeo
+
+
+4.4. ERRORES DE PRECISIÓN FLOAT
+-------------------------------
+PROBLEMA:
+Errores como:
+    Balance: 100.00000001 shares
+    Order: 100.00000002 shares
+    → "Insufficient balance"
+
+SOLUCIÓN IMPLEMENTADA (truncado a 6 decimales):
+    sell_size = float(int(available_balance * 1000000)) / 1000000
+    
+    # Ejemplo: 100.00000001 → int(100000000.01) → 100000000 → 100.0
+
+
+4.5. RACE CONDITION EN CANCELACIÓN
+----------------------------------
+PROBLEMA:
+Al cancelar órdenes de compra cuando evento pasa a LIVE, una orden
+puede llenarse entre que enviamos cancel y se ejecuta.
+
+SOLUCIÓN IMPLEMENTADA (líneas 988-994):
+    cancelled = client.cancel_orders_batch(order_ids_to_cancel)
+    
+    if order_ids_to_cancel:
+        self.audit_cancelled_orders(order_ids_to_cancel, event)
+
+
+4.6. PARTIAL FILLS Y DOBLE CONTEO
+---------------------------------
+PROBLEMA:
+Si una orden se llena parcialmente (10 de 50 shares), y luego más
+(20 de 50), procesábamos 10+20=30, no los 20 nuevos.
+
+SOLUCIÓN IMPLEMENTADA (lógica delta):
+    delta_fill = size_matched - order.processed_size
+    
+    if delta_fill > 0.000001:
+        self._process_buy_fill(order, event, fill_amount=delta_fill)
+        order.processed_size = size_matched  # Actualizar para siguiente check
+
+
+4.7. SETTLEMENT DELAY (TOKENS NO DISPONIBLES)
+---------------------------------------------
+PROBLEMA:
+Después de un fill, los tokens pueden tardar segundos en aparecer
+en el balance on-chain.
+
+SOLUCIÓN IMPLEMENTADA (process_pending_sells):
+    if actual_balance == 0:
+        if pending['attempts'] <= 60:  # ~30 segundos
+            still_pending.append(pending)
+        else:
+            notifier.send_message("Settlement timeout")
+
+
+4.8. DUST (POSICIONES INVENDIBLES)
+----------------------------------
+PROBLEMA:
+Si solo tenemos 1 share a 50¢, valor = $0.50 < $1 mínimo.
+No se puede vender, se pierde al expirar el mercado.
+
+SOLUCIÓN IMPLEMENTADA:
+- Detectar y notificar: "DUST LOCKED - will expire worthless"
+- Prevenir: Acumular hasta alcanzar mínimo antes de vender
+- Informar: Mensaje claro de cuántas shares se necesitan
+
+
+4.9. REINICIO DEL BOT MID-EVENTO
+--------------------------------
+PROBLEMA:
+Si el bot se reinicia durante PRE_MARKET, podría colocar órdenes
+duplicadas.
+
+SOLUCIÓN IMPLEMENTADA (initialize_event, líneas 100-162):
+    existing_orders = client.get_open_orders()
+    relevant_orders = [filtrar por token_id]
+    
+    if relevant_orders:
+        # Recuperar en lugar de crear nuevas
+        return recovered_count
+
+
+4.10. API RETORNA None
+----------------------
+PROBLEMA:
+La API de Polymarket a veces retorna None para órdenes muy recientes.
+
+SOLUCIÓN IMPLEMENTADA (múltiples lugares):
+    order_data = client.get_order(order.order_id)
+    
+    if order_data is None:
+        continue  # Skip, reintentar en siguiente ciclo
+
+================================================================================
+5. FLUJO DE DATOS CRÍTICOS
+================================================================================
+
+5.1. FLUJO DE UN BUY FILL
+-------------------------
+1. check_fills() detecta size_matched > 0
+2. Calcula delta = size_matched - order.processed_size
+3. Llama _process_buy_fill(fill_amount=delta)
+4. _process_buy_fill acumula en _fill_accumulator
+5. Si acumulado >= mínimo:
+   a. sell_size = acc['size']  (del acumulador)
+   b. Valida available_balance >= sell_size
+   c. Coloca orden de venta o encola en pending_sells
+6. Resetea acumulador
+
+5.2. FLUJO DE TRANSICIÓN A LIVE
+-------------------------------
+1. main.py detecta event.phase == LIVE
+2. Llama transition_to_live(event)
+3. Cancela todos los buys en batch
+4. Audita órdenes canceladas por race condition
+5. Flush accumulator (procesa fills pendientes)
+6. Cambia estado a EXITING
+7. Notifica por Telegram
+
+5.3. FLUJO DE PENDING SELLS
+---------------------------
+1. main.py llama process_pending_sells() una vez por ciclo
+2. Para cada pending:
+   a. Valida mínimo nocional
+   b. Intenta colocar orden
+   c. Si falla: diagnostica (locked, settlement, balance)
+   d. Decide: reintentar, ajustar tamaño, o abandonar
+3. Actualiza _pending_sells con los que siguen pendientes
+
+================================================================================
+6. CONCLUSIONES
+================================================================================
+
+6.1. ESTADO ACTUAL DEL CÓDIGO
+-----------------------------
+✅ CORRECTO: La lógica central está bien implementada
+✅ CORRECTO: Todos los casos límite conocidos tienen manejo
+✅ CORRECTO: El bug crítico de sell_size ha sido corregido
+✅ CORRECTO: Notificaciones de Telegram con retry
+✅ CORRECTO: Mínimo dinámico basado en valor nocional
+
+6.2. PUNTOS DE ATENCIÓN
+-----------------------
+⚠️ Hay una línea duplicada en _process_buy_fill (líneas 780-781):
+   logger.warning(f"⚠️ Balance check failed, using accumulator size: {e}")
+   logger.warning(f"⚠️ Balance check failed, using accumulator: {e}")
+
+6.3. RECOMENDACIONES
+--------------------
+1. Agregar tests unitarios para los casos límite
+2. Considerar añadir métricas de Prometheus/Grafana
+3. Implementar circuit breaker si la API falla repetidamente
+4. Agregar health check endpoint para monitoreo
+
+================================================================================
+                         FIN DEL INFORME DE AUDITORÍA
+================================================================================

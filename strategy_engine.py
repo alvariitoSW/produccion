@@ -381,9 +381,42 @@ class StrategyEngine:
                 # Still failing - increment attempts
                 pending['attempts'] += 1
                 
-                # SMART RETRY: Check actual balance on EVERY failed attempt (not just after 5)
+                # SMART RETRY: Check actual balance AND open orders
                 try:
                     actual_balance = self.client.get_token_balance(pending['token_id'])
+                    
+                    # ⚠️ CRITICAL: Check if tokens are already locked in open sell orders
+                    # Polymarket locks tokens when you have an open sell order
+                    open_orders = self.client.get_open_orders()
+                    locked_in_sells = sum(
+                        float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
+                        for o in open_orders
+                        if o.get("asset_id") == pending['token_id'] 
+                        and o.get("side", "").upper() == "SELL"
+                    )
+                    
+                    available_balance = actual_balance - locked_in_sells
+                    
+                    if available_balance <= 0:
+                        # Tokens are locked in existing sell orders - no need to retry
+                        logger.warning(
+                            f"🔒 Tokens locked: {actual_balance:.2f} total, {locked_in_sells:.2f} in open sells. "
+                            f"Skipping retry for {pending['side'].display_name}"
+                        )
+                        # Check if we already have a sell order for this - avoid duplicates
+                        existing_sell = any(
+                            o.get("asset_id") == pending['token_id'] 
+                            and o.get("side", "").upper() == "SELL"
+                            and abs(float(o.get("price", 0)) - pending['exit_price']) < 0.001
+                            for o in open_orders
+                        )
+                        if existing_sell:
+                            logger.info(f"✅ Sell order already exists for this position - removing from pending")
+                            continue  # Don't retry, order already exists
+                        # If no matching order exists but balance is locked, keep trying briefly
+                        if pending['attempts'] <= 5:
+                            still_pending.append(pending)
+                        continue
                     
                     if actual_balance == 0:
                         # Settlement delay - tokens not yet on-chain
@@ -400,30 +433,38 @@ class StrategyEngine:
                             )
                         continue
                         
-                    elif 0 < actual_balance < pending['size']:
-                        # FLOAT PRECISION: Actual balance is less than requested
-                        # Use the REAL balance (truncated to avoid over-selling)
-                        adjusted_size = float(int(actual_balance * 1000000)) / 1000000  # Truncate to 6 decimals
+                    elif 0 < available_balance < pending['size']:
+                        # Available balance is less than requested - adjust size
+                        adjusted_size = float(int(available_balance * 1000000)) / 1000000  # Truncate to 6 decimals
+                        
+                        # Validate minimum notional
+                        if adjusted_size * pending['exit_price'] < MIN_NOTIONAL_VALUE_USDC:
+                            logger.error(
+                                f"💀 DUST after adjustment: {adjusted_size:.4f} shares @ {int(pending['exit_price']*100)}¢ "
+                                f"= ${adjusted_size * pending['exit_price']:.4f} < ${MIN_NOTIONAL_VALUE_USDC}"
+                            )
+                            continue  # Can't sell dust
+                        
                         logger.warning(
-                            f"📉 Float precision fix: {pending['size']:.6f} -> {adjusted_size:.6f} "
-                            f"for {pending['slug']}"
+                            f"📉 Balance adjustment: {pending['size']:.6f} -> {adjusted_size:.6f} "
+                            f"(available: {available_balance:.6f}, locked: {locked_in_sells:.6f})"
                         )
                         pending['size'] = adjusted_size
                         pending['attempts'] = 0  # Reset for new size
                         still_pending.append(pending)
                         continue
                         
-                    elif actual_balance >= pending['size']:
-                        # We have enough balance but order still failed - API issue
+                    elif available_balance >= pending['size']:
+                        # We have enough available balance but order still failed - API issue
                         if pending['attempts'] <= 10:
                             still_pending.append(pending)
                             logger.warning(
-                                f"⚠️ SELL retry {pending['attempts']}/10 (balance OK): "
+                                f"⚠️ SELL retry {pending['attempts']}/10 (avail={available_balance:.2f}): "
                                 f"{pending['side'].display_name} @ {int(pending['exit_price']*100)}¢"
                             )
                         else:
                             logger.error(
-                                f"❌ GAVE UP on SELL after 10 attempts (balance was OK): "
+                                f"❌ GAVE UP on SELL after 10 attempts (avail={available_balance:.2f}): "
                                 f"{pending['side'].display_name}"
                             )
                             self.notifier.send_message(
@@ -562,10 +603,34 @@ class StrategyEngine:
                     f"(${notional_value:.4f} meets ${MIN_NOTIONAL_VALUE_USDC} minimum)"
                 )
                 
-                # 🛡️ PRECISION SAFETY: Use actual balance (truncated)
+                # ⚠️ CRITICAL: Keep sell_size from accumulator, only reduce if necessary
+                # sell_size is already set from acc['size'] above
+                
+                # 🛡️ SAFETY: Verify we have enough available balance
                 try:
                     actual_balance = self.client.get_token_balance(token_id)
-                    sell_size = float(int(actual_balance * 1000000)) / 1000000
+                    
+                    # Check tokens locked in open sell orders
+                    open_orders = self.client.get_open_orders()
+                    locked_in_sells = sum(
+                        float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
+                        for o in open_orders
+                        if o.get("asset_id") == token_id 
+                        and o.get("side", "").upper() == "SELL"
+                    )
+                    
+                    available_balance = actual_balance - locked_in_sells
+                    
+                    # Only reduce if available is LESS than what we want to sell
+                    if available_balance < sell_size:
+                        if available_balance <= 0:
+                            logger.warning(
+                                f"🔒 All tokens locked in flush ({locked_in_sells:.2f} in sells). Skipping."
+                            )
+                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                            continue
+                        
+                        sell_size = float(int(available_balance * 1000000)) / 1000000
                     
                     if sell_size * exit_price < MIN_NOTIONAL_VALUE_USDC:
                         logger.error(f"💀 DUST in flush: ${sell_size * exit_price:.4f} < ${MIN_NOTIONAL_VALUE_USDC}")
@@ -662,12 +727,41 @@ class StrategyEngine:
         if acc['size'] >= SELL_THRESHOLD:
             avg_entry = acc['total_entry_value'] / acc['size']
             
-            # 🛡️ PRECISION SAFETY: Always use actual balance (truncated)
-            # This avoids "insufficient balance" errors from float imprecision
+            # ⚠️ CRITICAL: Use accumulator size, NOT total balance!
+            # The accumulator tracks exactly how many shares we need to sell for THIS fill
+            sell_size = acc['size']
+            
+            # 🛡️ SAFETY: Verify we have enough available balance
             try:
                 actual_balance = self.client.get_token_balance(order.token_id)
-                # Truncate to 6 decimals
-                sell_size = float(int(actual_balance * 1000000)) / 1000000
+                
+                # Check tokens locked in open sell orders
+                open_orders = self.client.get_open_orders()
+                locked_in_sells = sum(
+                    float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
+                    for o in open_orders
+                    if o.get("asset_id") == order.token_id 
+                    and o.get("side", "").upper() == "SELL"
+                )
+                
+                available_balance = actual_balance - locked_in_sells
+                
+                # Only reduce sell_size if available is LESS than what we want to sell
+                if available_balance < sell_size:
+                    if available_balance <= 0:
+                        logger.warning(
+                            f"🔒 All tokens locked in open sells ({locked_in_sells:.2f}). "
+                            f"Will retry when orders fill/cancel."
+                        )
+                        # Don't clear accumulator - keep tracking
+                        return
+                    
+                    # Use available balance (truncated)
+                    sell_size = float(int(available_balance * 1000000)) / 1000000
+                    logger.warning(
+                        f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
+                        f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
+                    )
                 
                 # Validate minimum notional ($1 USDC)
                 if sell_size * exit_price < MIN_NOTIONAL_VALUE_USDC:
@@ -679,7 +773,7 @@ class StrategyEngine:
                     return
                     
             except Exception as e:
-                logger.warning(f"⚠️ Balance check failed, using accumulator: {e}")
+                logger.warning(f"⚠️ Balance check failed, using accumulator size: {e}")
                 sell_size = acc['size']
             
             # Reset accumulator
