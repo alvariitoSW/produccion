@@ -64,7 +64,18 @@ class StrategyEngine:
         """
         # Round to avoid float precision issues
         entry_rounded = round(entry_price, 2)
-        return EXIT_PRICES.get(entry_rounded, 0.49)  # Default to 49¢ if not mapped
+        exit_price = EXIT_PRICES.get(entry_rounded)
+        
+        if exit_price is None:
+            # DIAGNOSTIC: Log when using default (potential issue)
+            logger.warning(
+                f"⚠️ Entry price {entry_price:.6f} (rounded: {entry_rounded}) "
+                f"NOT in EXIT_PRICES map! Using default 49¢. "
+                f"Available keys: {sorted(EXIT_PRICES.keys())}"
+            )
+            return 0.49
+        
+        return exit_price
     
     def _needs_stop_loss(self, entry_price: float) -> bool:
         """Check if an entry price needs a stop-loss order."""
@@ -266,7 +277,7 @@ class StrategyEngine:
                     delta_fill = size_matched - order.processed_size
                     
                     if delta_fill > 0.000001:  # Floating point tolerance
-                        logger.info(f"✅ BUY fill detected: +{delta_fill:.4f} shares (Total: {size_matched})")
+                        logger.info(f"✅ BUY fill: +{delta_fill:.2f} shares @ {order.price:.2f}¢ → Total: {size_matched:.2f}")
                         
                         # Process the fill IMMEDIATELY
                         safe_delta = round(delta_fill, 6)
@@ -701,9 +712,9 @@ class StrategyEngine:
         # The mutation of order.size is dangerous, so explicit arg is better.
         actual_size = fill_amount if fill_amount is not None else order.size
         
+        # DIAGNOSTIC: Log exact prices to detect float precision issues
         logger.info(
-            f"✅ BUY FILLED: {order.side.display_name} @ {int(entry_price*100)}¢ "
-            f"→ Exit target: {int(exit_price*100)}¢"
+            f"✅ BUY FILLED: {order.side.display_name} @ {entry_price:.2f}¢ → Exit: {exit_price:.2f}¢ ({actual_size:.0f} shares)"
         )
         
         # Notify Telegram
@@ -753,8 +764,8 @@ class StrategyEngine:
         acc['total_entry_value'] += actual_size * entry_price
         
         logger.info(
-            f"📦 Accumulated for exit @{int(exit_price*100)}¢: {acc['size']:.2f} shares "
-            f"(need {min_shares_required:.2f} = ${MIN_NOTIONAL_VALUE_USDC}/{exit_price:.2f})"
+            f"📦 Accumulated: {acc['size']:.0f} shares @ exit {exit_price:.2f}¢ "
+            f"(need {min_shares_required:.0f} for ${MIN_NOTIONAL_VALUE_USDC} min)"
         )
         
         # Only place sell when we have enough shares for this specific exit price
@@ -829,7 +840,7 @@ class StrategyEngine:
             if sell_order:
                 sell_order.entry_price = avg_entry
                 self._sell_orders[slug].append(sell_order)
-                logger.info(f"✅ SELL order placed: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
+                logger.info(f"✅ SELL placed: {order.side.display_name} @ {exit_price:.2f}¢ x{sell_size:.0f}")
                 
                 # Notify via Telegram (critical for monitoring)
                 self.notifier.send_sell_placed(
@@ -851,7 +862,7 @@ class StrategyEngine:
                     'attempts': 1
                 }
                 self._pending_sells.append(pending)
-                logger.warning(f"⚠️ SELL failed, queued for retry: {order.side.display_name} @ {int(exit_price*100)}¢ x{sell_size}")
+                logger.warning(f"⚠️ SELL queued for retry: {order.side.display_name} @ {exit_price:.2f}¢ x{sell_size:.0f}")
         
     def audit_cancelled_orders(self, order_ids: List[str], event: EventContext) -> None:
         """
