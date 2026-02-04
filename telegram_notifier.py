@@ -24,28 +24,55 @@ class TelegramNotifier:
         self.enabled = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
         self._session = requests.Session()
         
+        # Configure session for better reliability
+        self._session.headers.update({
+            'Connection': 'keep-alive',
+            'Keep-Alive': 'timeout=30, max=100'
+        })
+        
         if not self.enabled:
             logger.warning("⚠️ Telegram notifications disabled (missing credentials)")
     
-    def send_message(self, message: str) -> bool:
-        """Send a Telegram message."""
+    def send_message(self, message: str, retries: int = 3) -> bool:
+        """Send a Telegram message with retry logic."""
         if not self.enabled:
             return False
         
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            
-            response = self._session.post(url, json=payload, timeout=10)
-            return response.status_code == 200
-            
-        except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
-            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        
+        for attempt in range(retries):
+            try:
+                response = self._session.post(url, json=payload, timeout=15)
+                
+                if response.status_code == 200:
+                    return True
+                else:
+                    logger.warning(f"⚠️ Telegram HTTP {response.status_code} (attempt {attempt+1}/{retries})")
+                    
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                logger.warning(f"⚠️ Telegram connection error (attempt {attempt+1}/{retries}): {e}")
+                
+                # Recreate session on connection errors
+                if attempt < retries - 1:
+                    logger.debug("🔄 Recreating Telegram session...")
+                    self._session.close()
+                    self._session = requests.Session()
+                    self._session.headers.update({
+                        'Connection': 'keep-alive',
+                        'Keep-Alive': 'timeout=30, max=100'
+                    })
+                    
+            except Exception as e:
+                logger.error(f"❌ Telegram unexpected error (attempt {attempt+1}/{retries}): {e}")
+        
+        # All retries failed
+        logger.error(f"❌ Telegram failed after {retries} attempts")
+        return False
     
     def send_startup(self, balance: float) -> bool:
         """Send bot startup notification."""
