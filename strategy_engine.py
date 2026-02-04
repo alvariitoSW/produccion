@@ -338,7 +338,71 @@ class StrategyEngine:
                         self._known_filled.add(order.order_id)
                          
                 except Exception as e:
-                    logger.error(f"❌ Error verifying sell fill for {order.order_id}: {e}")
+                    logger.error(f"❌ Error verifying sell fill for {order.order_id[:10]}: {e}")
+                    # Track API failures for this order
+                    if not hasattr(order, 'verify_fail_count'):
+                        order.verify_fail_count = 0
+                    order.verify_fail_count += 1
+                    
+                    if order.verify_fail_count >= 3:  # FAST recovery: only 3 attempts
+                        logger.error(
+                            f"⚠️ SELL order {order.order_id[:10]} desapareció! Recuperación RÁPIDA..."
+                        )
+                        
+                        # RESILIENCE: Check actual token balance to decide action
+                        try:
+                            actual_balance = self.client.get_token_balance(order.token_id)
+                            
+                            if actual_balance >= order.size * 0.99:  # We still have the tokens
+                                logger.warning(
+                                    f"🔄 RECOVERY RÁPIDA: Tokens en wallet ({actual_balance:.2f} shares). "
+                                    f"Recolocando venta en <3 segundos..."
+                                )
+                                # Add to pending sells for retry
+                                pending = {
+                                    'token_id': order.token_id,
+                                    'side': order.side,
+                                    'exit_price': order.price,
+                                    'size': order.size,
+                                    'slug': slug,
+                                    'entry_price': order.entry_price or 0,
+                                    'attempts': 0
+                                }
+                                self._pending_sells.append(pending)
+                                self._known_filled.add(order.order_id)  # Stop tracking the old order
+                                order.verify_fail_count = 0  # Reset on success
+                                
+                                self.notifier.send_message(
+                                    f"🔄 RECOVERY RÁPIDA (<3s):\n"
+                                    f"Venta {order.price:.2f}¢ recolocada automáticamente\n"
+                                    f"{order.size:.0f} shares | {slug}"
+                                )
+                            else:
+                                # Tokens not found - likely sold or error
+                                logger.warning(
+                                    f"✅ RECOVERY RÁPIDA: Tokens vendidos (balance={actual_balance:.2f}). "
+                                    f"Procesando como venta ejecutada en <3s."
+                                )
+                                self._known_filled.add(order.order_id)
+                                order.verify_fail_count = 0  # Reset on success
+                                
+                                # Try to process as sell fill (PnL might be off but better than losing track)
+                                if order.entry_price and order.entry_price > 0:
+                                    self._process_sell_fill(order, event, is_stop_loss=False)
+                                
+                        except Exception as balance_err:
+                            logger.error(f"❌ Recovery attempt #{order.verify_fail_count} failed: {balance_err}")
+                            # NO resetear contador - seguir intentando en próximos ciclos
+                            # Enviar alerta solo cada 10 intentos para no spamear
+                            if order.verify_fail_count % 10 == 0:
+                                self.notifier.send_message(
+                                    f"⚠️ API CAÍDA (intento {order.verify_fail_count}):\n"
+                                    f"No se puede verificar orden {order.order_id[:10]}.\n"
+                                    f"El bot seguirá intentando automáticamente."
+                                )
+                        else:
+                            # Success: reset counter and stop tracking this order
+                            order.verify_fail_count = 0
 
         # NOTE: Pending sells are processed once per cycle in main.py, not per-event
         
@@ -1050,6 +1114,8 @@ class StrategyEngine:
         Check if strategy is complete for an event.
         Complete when in EXITING state and no open sell orders.
         
+        IMPROVED: Detects sells that disappeared without filling (event resolution).
+        
         Args:
             event: The event context
             cached_open_ids: Optional set of open order IDs (avoids extra API call)
@@ -1066,17 +1132,93 @@ class StrategyEngine:
         else:
             open_ids = cached_open_ids
         
-        has_pending_sells = any(
-            o.order_id in open_ids
-            for o in self._sell_orders.get(slug, [])
-        )
+        # Track sells that are still open vs disappeared
+        pending_sells = []
+        disappeared_sells = []
+        
+        for o in self._sell_orders.get(slug, []):
+            if o.order_id in self._known_filled:
+                continue  # Already processed
+            
+            if o.order_id in open_ids:
+                pending_sells.append(o)
+            else:
+                # Order disappeared - check if it was filled or just cancelled
+                try:
+                    order_data = self.client.get_order(o.order_id)
+                    if order_data:
+                        size_matched = float(order_data.get("size_matched") or order_data.get("sizeMatched") or 0)
+                        if size_matched > 0:
+                            # Was filled - process it
+                            o.size = size_matched
+                            self._process_sell_fill(o, event, is_stop_loss=False)
+                            self._known_filled.add(o.order_id)
+                        else:
+                            # Disappeared with 0 fills = cancelled by event resolution
+                            disappeared_sells.append(o)
+                            self._known_filled.add(o.order_id)
+                    else:
+                        # API returned None - assume cancelled
+                        disappeared_sells.append(o)
+                        self._known_filled.add(o.order_id)
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not verify sell {o.order_id[:10]}: {e}")
+                    disappeared_sells.append(o)
+                    self._known_filled.add(o.order_id)
+        
+        # Alert about sells that didn't execute
+        if disappeared_sells:
+            # RESILIENCE RÁPIDA: For each disappeared sell, check if tokens still exist
+            recovered = 0
+            for sell_order in disappeared_sells:
+                try:
+                    actual_balance = self.client.get_token_balance(sell_order.token_id)
+                    
+                    if actual_balance >= sell_order.size * 0.99:  # Tokens still there
+                        logger.warning(
+                            f"🔄 RECOVERY INMEDIATA: Recolocando venta {actual_balance:.0f} shares @ {sell_order.price:.2f}¢"
+                        )
+                        # Requeue the sell
+                        pending = {
+                            'token_id': sell_order.token_id,
+                            'side': sell_order.side,
+                            'exit_price': sell_order.price,
+                            'size': actual_balance,  # Use actual balance
+                            'slug': slug,
+                            'entry_price': sell_order.entry_price or 0,
+                            'attempts': 0
+                        }
+                        self._pending_sells.append(pending)
+                        recovered += 1
+                except Exception as e:
+                    logger.error(f"❌ Recovery check failed for {sell_order.order_id[:10]}: {e}")
+            
+            if recovered > 0:
+                logger.warning(f"🔄 {recovered} ventas recuperadas INMEDIATAMENTE")
+                self.notifier.send_message(
+                    f"🔄 RECOVERY INMEDIATA ({slug}):\n"
+                    f"{recovered} venta(s) recolocada(s) en <1 segundo.\n"
+                    f"El bot continúa operando normalmente."
+                )
+            else:
+                total_lost_value = sum(s.size * s.price for s in disappeared_sells)
+                logger.warning(
+                    f"⚠️ {len(disappeared_sells)} sell orders lost (tokens not found): "
+                    f"~${total_lost_value:.2f} notional. Likely liquidated."
+                )
+                self.notifier.send_message(
+                    f"⚠️ ({slug}):\n"
+                    f"{len(disappeared_sells)} órdenes canceladas (tokens no encontrados).\n"
+                    f"Posiciones probablemente liquidadas al precio de resolución."
+                )
         
         has_pending_stops = any(
             o.order_id in open_ids
             for o in self._stop_loss_orders.get(slug, [])
+            if o.order_id not in self._known_filled
         )
         
-        if not has_pending_sells and not has_pending_stops:
+        if not pending_sells and not has_pending_stops:
             self._states[slug] = StrategyState.COMPLETED
             self._results[slug].end_time = time.time()
             
