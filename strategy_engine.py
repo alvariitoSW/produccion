@@ -529,13 +529,37 @@ class StrategyEngine:
                     elif 0 < available_balance < pending['size']:
                         # Available balance is less than requested - adjust to exact balance
                         adjusted_size = available_balance
+                        original_size = pending['size']  # Store original for comparison
                         
-                        # Validate minimum shares
+                        # 🛡️ CRITICAL FIX: If adjustment would create dust but original was NOT dust,
+                        # keep the original size and retry later (don't lose shares!)
                         if adjusted_size < MIN_SHARES:
-                            logger.error(
-                                f"💀 DUST after adjustment: {adjusted_size:.2f} shares < {MIN_SHARES} min"
-                            )
-                            continue  # Can't sell dust
+                            if original_size >= MIN_SHARES:
+                                # Original was valid - just need to wait for balance to settle
+                                logger.warning(
+                                    f"⚠️ DUST PROTECTION in retry: adjusted={adjusted_size:.2f} but original={original_size:.2f} >= {MIN_SHARES}. "
+                                    f"Keeping FULL SIZE and retrying (attempt {pending['attempts']})..."
+                                )
+                                # Keep original size, increment attempts
+                                pending['attempts'] += 1
+                                if pending['attempts'] <= 60:  # ~30 seconds at 0.5s poll
+                                    still_pending.append(pending)
+                                else:
+                                    # After 30s, alert but keep trying
+                                    logger.error(f"⚠️ Balance fragmentation >30s for {pending['slug']} - keeping in queue")
+                                    still_pending.append(pending)
+                                    if pending['attempts'] == 61:
+                                        self.notifier.send_message(
+                                            f"⚠️ Balance fragmentado >30s para {pending['side'].display_name}.\n"
+                                            f"Original: {original_size:.0f}, Disponible: {available_balance:.2f}\n"
+                                            f"El bot seguirá intentando automáticamente."
+                                        )
+                            else:
+                                # Original was also dust - truly unrecoverable
+                                logger.error(
+                                    f"💀 DUST after adjustment (original also dust): {adjusted_size:.2f} shares < {MIN_SHARES} min"
+                                )
+                            continue
                         
                         logger.warning(
                             f"📉 Balance adjustment: {pending['size']:.6f} -> {adjusted_size:.6f} "
@@ -761,6 +785,9 @@ class StrategyEngine:
                     
                     available_balance = actual_balance - locked_in_sells
                     
+                    # Store original size for potential retry queue
+                    original_sell_size = sell_size
+                    
                     # Only reduce if available is LESS than what we want to sell
                     if available_balance < sell_size:
                         if available_balance <= 0:
@@ -782,12 +809,50 @@ class StrategyEngine:
                             self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                             continue
                         
+                        # 🛡️ CRITICAL FIX: Check if adjustment would create dust
+                        if available_balance < MIN_SHARES:
+                            logger.warning(
+                                f"⏳ Available balance in flush ({available_balance:.2f}) < MIN_SHARES ({MIN_SHARES}). "
+                                f"Queuing ORIGINAL {sell_size:.2f} shares for retry (NOT losing them as dust!)"
+                            )
+                            pending = {
+                                'token_id': token_id,
+                                'side': side,
+                                'exit_price': exit_price,
+                                'size': sell_size,  # Original size, not adjusted dust!
+                                'slug': slug,
+                                'entry_price': avg_entry,
+                                'attempts': 0
+                            }
+                            self._pending_sells.append(pending)
+                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                            continue
+                        
                         sell_size = available_balance  # Use exact balance from Polymarket
                     
+                    # 🛡️ CRITICAL FIX: If adjusted to dust but original was NOT dust, queue for retry
                     if sell_size < MIN_SHARES:
-                        logger.error(f"💀 DUST in flush: {sell_size:.2f} shares < {MIN_SHARES} min")
-                        self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                        continue
+                        if original_sell_size >= MIN_SHARES:
+                            logger.warning(
+                                f"⚠️ DUST PROTECTION in flush: sell_size={sell_size:.2f} but original={original_sell_size:.2f} >= {MIN_SHARES}. "
+                                f"Queuing FULL SIZE for retry!"
+                            )
+                            pending = {
+                                'token_id': token_id,
+                                'side': side,
+                                'exit_price': exit_price,
+                                'size': original_sell_size,  # Restore original
+                                'slug': slug,
+                                'entry_price': avg_entry,
+                                'attempts': 0
+                            }
+                            self._pending_sells.append(pending)
+                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                            continue
+                        else:
+                            logger.error(f"💀 DUST in flush (original): {sell_size:.2f} shares < {MIN_SHARES} min")
+                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                            continue
                         
                 except Exception as e:
                     logger.warning(f"⚠️ Balance check failed in flush: {e}")
@@ -906,19 +971,39 @@ class StrategyEngine:
                         )
                         should_queue_for_retry = True
                     else:
-                        # Use exact available balance from Polymarket
-                        sell_size = available_balance
-                        logger.warning(
-                            f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
-                            f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
-                        )
+                        # 🛡️ CRITICAL FIX: If adjusted size would be DUST, queue FULL ORIGINAL SIZE instead!
+                        # This prevents losing shares when balance is temporarily low
+                        if available_balance < MIN_SHARES:
+                            logger.warning(
+                                f"⏳ Available balance ({available_balance:.2f}) < MIN_SHARES ({MIN_SHARES}). "
+                                f"Queuing ORIGINAL {sell_size:.2f} shares for retry (NOT losing them as dust!)"
+                            )
+                            should_queue_for_retry = True
+                        else:
+                            # Safe to adjust - available meets minimum
+                            sell_size = available_balance
+                            logger.warning(
+                                f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
+                                f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
+                            )
                 
-                # Validate minimum shares (6)
+                # Validate minimum shares (6) - only skip if truly dust AND original was dust too
                 if not should_queue_for_retry and sell_size < MIN_SHARES:
-                    logger.error(
-                        f"💀 DUST: {sell_size:.2f} shares < {MIN_SHARES} min"
-                    )
-                    return
+                    # 🛡️ CRITICAL FIX: Check if ORIGINAL accumulator size was >= MIN_SHARES
+                    # If so, we should NOT lose these shares - queue for retry!
+                    if acc['size'] >= MIN_SHARES:
+                        logger.warning(
+                            f"⚠️ DUST PROTECTION: sell_size={sell_size:.2f} but original acc={acc['size']:.2f} >= {MIN_SHARES}. "
+                            f"Queuing FULL SIZE for retry instead of losing shares!"
+                        )
+                        should_queue_for_retry = True
+                        sell_size = acc['size']  # Restore original size for pending queue
+                    else:
+                        # Original was also dust - nothing we can do
+                        logger.error(
+                            f"💀 DUST (original): {sell_size:.2f} shares < {MIN_SHARES} min"
+                        )
+                        return
                     
             except Exception as e:
                 logger.warning(f"⚠️ Balance check failed, queuing for retry: {e}")
