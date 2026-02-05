@@ -75,6 +75,7 @@ ORDER_SIZE = 30.0
 # DUST PROBLEM: Partial fills <5 shares = LOCKED until expiration
 
 MIN_SHARES = 6  # Polymarket requires 5 shares min, we use 6 for safety
+MIN_NOTIONAL = 1.0  # Minimum $ notional per order (dynamic $1 USDC rule)
 
 # ===========================================
 # TIMING (Optimized for Polymarket CLOB API limits)

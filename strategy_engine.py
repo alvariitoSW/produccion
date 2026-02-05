@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Set
 
-from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES, MIN_SHARES
+from config import LADDER_LEVELS, EXIT_PRICES, ORDER_SIZE, STOP_LOSS_PRICE, STOP_LOSS_ENTRIES, MIN_SHARES, MIN_NOTIONAL
 from models import (
     EventContext, OrderSide, OrderType, TrackedOrder,
     Position, CycleResult, StrategyState, MarketPhase
@@ -76,6 +76,18 @@ class StrategyEngine:
             return 0.49
         
         return exit_price
+
+    def _clamp_size(self, size: float) -> float:
+        """Clamp size to 6 decimal places and avoid negative/float drift."""
+        if size <= 0:
+            return 0.0
+        return max(0.0, round(size, 6))
+
+    def _meets_minimum(self, size: float, price: float) -> bool:
+        """Validate against BOTH min shares and min notional ($)."""
+        if size < MIN_SHARES:
+            return False
+        return (size * price) >= MIN_NOTIONAL
     
     def _needs_stop_loss(self, entry_price: float) -> bool:
         """Check if an entry price needs a stop-loss order."""
@@ -428,10 +440,12 @@ class StrategyEngine:
         still_pending = []
         
         for pending in self._pending_sells:
-            # ⚠️ DUST VALIDATION: Check if order meets minimum shares
-            if pending['size'] < MIN_SHARES:
+            pending['size'] = self._clamp_size(pending['size'])
+            # ⚠️ DUST VALIDATION: Check if order meets minimum shares/notional
+            if not self._meets_minimum(pending['size'], pending['exit_price']):
                 logger.error(
-                    f"💀 DUST REJECTED: {pending['size']:.2f} shares < {MIN_SHARES} min. "
+                    f"💀 DUST REJECTED: {pending['size']:.2f} shares @ {pending['exit_price']:.2f}¢ "
+                    f"(< {MIN_SHARES} shares or < ${MIN_NOTIONAL}). "
                     f"⚠️ Cannot sell - will expire worthless!"
                 )
                 # Don't retry, it will always fail
@@ -755,8 +769,8 @@ class StrategyEngine:
             sell_size = acc['size']
             avg_entry = acc['total_entry_value'] / acc['size'] if acc['size'] > 0 else 0
             
-            # Check if meets minimum shares
-            if sell_size < MIN_SHARES:
+            # Check if meets minimum shares/notional
+            if not self._meets_minimum(sell_size, exit_price):
                 # Don't mark as DUST LOCKED yet - collect for phase 2 combination
                 if side not in dust_by_side:
                     dust_by_side[side] = []
@@ -833,7 +847,19 @@ class StrategyEngine:
                         self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                         continue
                     
-                    sell_size = available_balance
+                    sell_size = self._clamp_size(available_balance)
+                    remainder = self._clamp_size(original_sell_size - sell_size)
+
+                    if remainder > 0:
+                        if side not in dust_by_side:
+                            dust_by_side[side] = []
+                        dust_by_side[side].append({
+                            'token_id': token_id,
+                            'size': remainder,
+                            'entry_value': remainder * avg_entry,
+                            'exit_price': exit_price,
+                            'acc_key': acc_key
+                        })
                     
             except Exception as e:
                 logger.warning(f"⚠️ Balance check failed in flush: {e}")
@@ -854,8 +880,6 @@ class StrategyEngine:
         # =========================================================================
         # PHASE 2: Combine dust from same side and sell at 49¢ if >= MIN_SHARES
         # =========================================================================
-        DUST_EXIT_PRICE = 0.49  # Arbitrary safe exit price for combined dust
-        
         for side, dust_list in dust_by_side.items():
             if not dust_list:
                 continue
@@ -866,6 +890,9 @@ class StrategyEngine:
             
             # Use the token_id from the first dust entry (they should all be the same for same side)
             token_id = dust_list[0]['token_id']
+
+            # Downgrade to the lowest exit price among fragments (cascading exit buckets)
+            dust_exit_price = min(d['exit_price'] for d in dust_list)
             
             # Calculate weighted average entry price
             avg_entry = total_entry_value / total_dust_size if total_dust_size > 0 else 0
@@ -874,25 +901,25 @@ class StrategyEngine:
             for d in dust_list:
                 self._fill_accumulator[d['acc_key']] = {'size': 0.0, 'total_entry_value': 0.0}
             
-            if total_dust_size >= MIN_SHARES:
+            if self._meets_minimum(total_dust_size, dust_exit_price):
                 # 🎉 Combined dust meets minimum - we can sell!
                 logger.warning(
                     f"🧹 DUST COMBINATION: {len(dust_list)} fragments = {total_dust_size:.2f} {side.display_name} "
-                    f"(>= {MIN_SHARES} min). Selling at {int(DUST_EXIT_PRICE*100)}¢!"
+                    f"(>= {MIN_SHARES} min). Selling at {int(dust_exit_price*100)}¢!"
                 )
                 
                 # Notify Telegram about the dust combination
                 self.notifier.send_message(
                     f"🧹 DUST COMBINED ({slug})\n"
                     f"{side.display_name}: {total_dust_size:.2f} shares from {len(dust_list)} levels\n"
-                    f"Selling at {int(DUST_EXIT_PRICE*100)}¢"
+                    f"Selling at {int(dust_exit_price*100)}¢"
                 )
                 
                 # Add to pending sells at arbitrary 49¢
                 pending = {
                     'token_id': token_id,
                     'side': side,
-                    'exit_price': DUST_EXIT_PRICE,
+                    'exit_price': dust_exit_price,
                     'size': total_dust_size,
                     'slug': slug,
                     'entry_price': avg_entry,
@@ -900,16 +927,66 @@ class StrategyEngine:
                 }
                 self._pending_sells.append(pending)
             else:
-                # Still not enough even combined - truly locked
-                logger.error(
-                    f"💀 DUST LOCKED (combined): {total_dust_size:.2f} {side.display_name} < {MIN_SHARES} min. "
-                    f"({len(dust_list)} fragments). Will expire worthless!"
-                )
-                self.notifier.send_message(
-                    f"💀 DUST LOCKED ({slug})\n"
-                    f"{side.display_name}: {total_dust_size:.2f} shares ({len(dust_list)} fragments)\n"
-                    f"⚠️ Cannot sell - will expire worthless!"
-                )
+                # DUST < MIN_SHARES in LIVE: attempt immediate market-like sell (limit-crossing)
+                if event.phase == MarketPhase.LIVE:
+                    current_bid = event.yes_bid if side == OrderSide.YES else event.no_bid
+                    target_price = avg_entry + 0.01  # Aim for +1¢ when possible
+                    if current_bid is not None:
+                        # Ensure immediate execution by crossing the book
+                        market_price = min(current_bid, target_price)
+                    else:
+                        # Fallback to ultra-low price to force execution
+                        market_price = 0.01
+
+                    market_price = max(0.01, round(market_price, 2))
+                    sell_size = self._clamp_size(total_dust_size)
+
+                    logger.warning(
+                        f"⚠️ DUST < {MIN_SHARES} in LIVE: Selling at market-like price {int(market_price*100)}¢ "
+                        f"({sell_size:.2f} {side.display_name})"
+                    )
+
+                    sell_order = self.client.place_limit_order(
+                        token_id=token_id,
+                        side=side,
+                        order_type=OrderType.SELL,
+                        price=market_price,
+                        size=sell_size,
+                        event_slug=slug
+                    )
+
+                    if sell_order:
+                        sell_order.entry_price = avg_entry
+                        if slug in self._sell_orders:
+                            self._sell_orders[slug].append(sell_order)
+                        else:
+                            self._sell_orders[slug] = [sell_order]
+
+                        self.notifier.send_message(
+                            f"⚠️ DUST MARKET SELL ({slug})\n"
+                            f"{side.display_name}: {sell_size:.2f} shares\n"
+                            f"Price: {int(market_price*100)}¢ (target +1¢)"
+                        )
+                    else:
+                        logger.error(
+                            f"💀 DUST MARKET SELL FAILED: {sell_size:.2f} {side.display_name} @ {market_price:.2f}¢"
+                        )
+                        self.notifier.send_message(
+                            f"💀 DUST MARKET SELL FAILED ({slug})\n"
+                            f"{side.display_name}: {sell_size:.2f} shares\n"
+                            f"Price: {int(market_price*100)}¢"
+                        )
+                else:
+                    # Still not enough even combined - truly locked (pre-market)
+                    logger.error(
+                        f"💀 DUST LOCKED (combined): {total_dust_size:.2f} {side.display_name} < {MIN_SHARES} min. "
+                        f"({len(dust_list)} fragments). Will expire worthless!"
+                    )
+                    self.notifier.send_message(
+                        f"💀 DUST LOCKED ({slug})\n"
+                        f"{side.display_name}: {total_dust_size:.2f} shares ({len(dust_list)} fragments)\n"
+                        f"⚠️ Cannot sell - will expire worthless!"
+                    )
     
     def _process_buy_fill(self, order: TrackedOrder, event: EventContext, fill_amount: Optional[float] = None) -> None:
         """Handle a buy order fill."""
@@ -976,14 +1053,14 @@ class StrategyEngine:
         # Only place sell when we have enough shares for this specific exit price
         if acc['size'] >= MIN_SHARES:
             avg_entry = acc['total_entry_value'] / acc['size']
+            original_acc_size = acc['size']
+            original_total_entry_value = acc['total_entry_value']
             
             # ⚠️ CRITICAL: Use accumulator size, NOT total balance!
             # The accumulator tracks exactly how many shares we need to sell for THIS fill
             sell_size = acc['size']
             
-            # Reset accumulator FIRST (we're committed to selling these shares)
-            # This prevents double-processing if we go to pending_sells
-            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+            # NOTE: Do NOT reset accumulator yet. We may need to keep a remainder.
             
             # 🛡️ SAFETY: Verify we have enough available balance
             should_queue_for_retry = False
@@ -1020,23 +1097,53 @@ class StrategyEngine:
                             should_queue_for_retry = True
                         else:
                             # Safe to adjust - available meets minimum
-                            sell_size = available_balance
+                            sell_size = self._clamp_size(available_balance)
+                            remainder = self._clamp_size(original_acc_size - sell_size)
+
+                            if remainder >= MIN_SHARES:
+                                pending = {
+                                    'token_id': order.token_id,
+                                    'side': order.side,
+                                    'exit_price': exit_price,
+                                    'size': remainder,
+                                    'slug': slug,
+                                    'entry_price': avg_entry,
+                                    'attempts': 0
+                                }
+                                self._pending_sells.append(pending)
+                                logger.warning(
+                                    f"⚠️ PARTIAL FILL: Selling {sell_size:.2f} now, queued {remainder:.2f} for retry"
+                                )
+                                # All remainder is queued, clear accumulator
+                                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                            elif remainder > 0:
+                                # Keep sub-minimum remainder in accumulator (do NOT lose it)
+                                self._fill_accumulator[acc_key] = {
+                                    'size': remainder,
+                                    'total_entry_value': remainder * avg_entry
+                                }
+                                logger.warning(
+                                    f"⚠️ PARTIAL FILL: Selling {sell_size:.2f} now, keeping {remainder:.2f} in accumulator"
+                                )
+                            else:
+                                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+
                             logger.warning(
-                                f"📉 Adjusted sell size: {acc['size']:.2f} → {sell_size:.2f} "
+                                f"📉 Adjusted sell size: {original_acc_size:.2f} → {sell_size:.2f} "
                                 f"(available: {available_balance:.2f}, locked: {locked_in_sells:.2f})"
                             )
                 
                 # Validate minimum shares (6) - only skip if truly dust AND original was dust too
-                if not should_queue_for_retry and sell_size < MIN_SHARES:
+                if not should_queue_for_retry and not self._meets_minimum(sell_size, exit_price):
                     # 🛡️ CRITICAL FIX: Check if ORIGINAL accumulator size was >= MIN_SHARES
                     # If so, we should NOT lose these shares - queue for retry!
-                    if acc['size'] >= MIN_SHARES:
+                    if original_acc_size >= MIN_SHARES:
                         logger.warning(
-                            f"⚠️ DUST PROTECTION: sell_size={sell_size:.2f} but original acc={acc['size']:.2f} >= {MIN_SHARES}. "
+                            f"⚠️ DUST PROTECTION: sell_size={sell_size:.2f} but original acc={original_acc_size:.2f} >= {MIN_SHARES}. "
                             f"Queuing FULL SIZE for retry instead of losing shares!"
                         )
                         should_queue_for_retry = True
-                        sell_size = acc['size']  # Restore original size for pending queue
+                        sell_size = original_acc_size  # Restore original size for pending queue
                     else:
                         # Original was also dust - nothing we can do
                         logger.error(
@@ -1054,16 +1161,34 @@ class StrategyEngine:
                     'token_id': order.token_id,
                     'side': order.side,
                     'exit_price': exit_price,
-                    'size': acc['size'],  # Use original accumulator size
+                    'size': original_acc_size,  # Use original accumulator size
                     'slug': slug,
                     'entry_price': avg_entry,
                     'attempts': 0
                 }
                 self._pending_sells.append(pending)
-                logger.warning(f"⚠️ SELL queued for retry (settlement): {order.side.display_name} @ {exit_price:.2f}¢ x{acc['size']:.0f}")
+                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                logger.warning(f"⚠️ SELL queued for retry (settlement): {order.side.display_name} @ {exit_price:.2f}¢ x{original_acc_size:.0f}")
                 return
             
             # Try to place the sell order
+            sell_size = self._clamp_size(sell_size)
+            if not self._meets_minimum(sell_size, exit_price):
+                logger.error(
+                    f"💀 DUST (min notional/shares): {sell_size:.2f} @ {exit_price:.2f}¢ "
+                    f"(min {MIN_SHARES} shares & ${MIN_NOTIONAL})"
+                )
+                # Keep any remainder in accumulator (if present), otherwise clear
+                if acc_key not in self._fill_accumulator:
+                    self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                return
+
+            # Clear accumulator if it still holds the original batch (no remainder kept)
+            if acc_key in self._fill_accumulator:
+                acc_snapshot = self._fill_accumulator[acc_key]
+                if acc_snapshot['size'] == original_acc_size:
+                    self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+
             sell_order = self.client.place_limit_order(
                 token_id=order.token_id,
                 side=order.side,
@@ -1077,6 +1202,9 @@ class StrategyEngine:
                 sell_order.entry_price = avg_entry
                 self._sell_orders[slug].append(sell_order)
                 logger.info(f"✅ SELL placed: {order.side.display_name} @ {exit_price:.2f}¢ x{sell_size:.0f}")
+                # If we didn't keep remainder earlier, ensure accumulator is cleared
+                if acc_key not in self._fill_accumulator:
+                    self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                 
                 # Notify via Telegram (critical for monitoring)
                 self.notifier.send_sell_placed(
@@ -1098,6 +1226,7 @@ class StrategyEngine:
                     'attempts': 1
                 }
                 self._pending_sells.append(pending)
+                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
                 logger.warning(f"⚠️ SELL queued for retry: {order.side.display_name} @ {exit_price:.2f}¢ x{sell_size:.0f}")
         
     def audit_cancelled_orders(self, order_ids: List[str], event: EventContext) -> None:
