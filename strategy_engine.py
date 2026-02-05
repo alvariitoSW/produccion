@@ -728,149 +728,188 @@ class StrategyEngine:
         """
         Flush any accumulated shares for an event when transitioning to LIVE.
         
-        CRITICAL: Polymarket enforces Precio × Cantidad ≥ 1 USDC.
-        If dust doesn't meet minimum, it gets LOCKED until market expiration.
-        We try to sell anyway and log if rejected.
+        STRATEGY:
+        1. First, process accumulators that have >= MIN_SHARES normally (with their exit_price)
+        2. Then, combine ALL dust from the same side (YES/NO) regardless of exit_price
+        3. If combined dust >= MIN_SHARES, sell it all at 49¢ (arbitrary safe price)
+        
+        This ensures we don't lose shares just because they came from different price levels.
         """
         slug = event.slug
         
         # Find all accumulator keys for this event
         keys_to_flush = [k for k in self._fill_accumulator.keys() if k[0] == slug]
         
+        # =========================================================================
+        # PHASE 1: Process accumulators with >= MIN_SHARES (normal flow)
+        # =========================================================================
+        dust_by_side: Dict[OrderSide, List[Dict]] = {}  # Collect dust for phase 2
+        
         for acc_key in keys_to_flush:
             acc = self._fill_accumulator[acc_key]
             
-            if acc['size'] > 0.001:  # Only if there's meaningful size
-                _, side, token_id, exit_price = acc_key
-                sell_size = acc['size']
-                avg_entry = acc['total_entry_value'] / acc['size'] if acc['size'] > 0 else 0
+            if acc['size'] < 0.001:  # Skip empty accumulators
+                continue
                 
-                # Check if meets minimum shares
-                if sell_size < MIN_SHARES:
-                    logger.error(
-                        f"💀 DUST LOCKED: {sell_size:.2f} shares < {MIN_SHARES} min. "
-                        f"⚠️ These shares will be LOCKED until market expiration!"
-                    )
-                    # Clear accumulator anyway (nothing we can do)
-                    self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                    
-                    # Notify Telegram about locked dust
-                    self.notifier.send_message(
-                        f"💀 DUST LOCKED ({slug})\n"
-                        f"{side.display_name}: {sell_size:.2f} shares < {MIN_SHARES} min\n"
-                        f"⚠️ Cannot sell - will expire worthless!"
-                    )
-                    continue  # Skip this dust, cannot sell
+            _, side, token_id, exit_price = acc_key
+            sell_size = acc['size']
+            avg_entry = acc['total_entry_value'] / acc['size'] if acc['size'] > 0 else 0
+            
+            # Check if meets minimum shares
+            if sell_size < MIN_SHARES:
+                # Don't mark as DUST LOCKED yet - collect for phase 2 combination
+                if side not in dust_by_side:
+                    dust_by_side[side] = []
+                dust_by_side[side].append({
+                    'token_id': token_id,
+                    'size': sell_size,
+                    'entry_value': acc['total_entry_value'],
+                    'exit_price': exit_price,
+                    'acc_key': acc_key
+                })
+                logger.info(
+                    f"📦 DUST collected for combination: {sell_size:.2f} {side.display_name} @ {int(exit_price*100)}¢"
+                )
+                continue  # Will be processed in phase 2
+            
+            # Normal flow: >= MIN_SHARES
+            logger.warning(
+                f"📦 FLUSH ACCUMULATOR: {sell_size:.0f} shares @ exit {int(exit_price*100)}¢ "
+                f"(meets {MIN_SHARES} shares minimum)"
+            )
+            
+            # 🛡️ SAFETY: Verify we have enough available balance
+            try:
+                actual_balance = self.client.get_token_balance(token_id)
                 
-                logger.warning(
-                    f"📦 FLUSH ACCUMULATOR: {sell_size:.0f} shares @ exit {int(exit_price*100)}¢ "
-                    f"(meets {MIN_SHARES} shares minimum)"
+                # Check tokens locked in open sell orders
+                open_orders = self.client.get_open_orders()
+                locked_in_sells = sum(
+                    float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
+                    for o in open_orders
+                    if o.get("asset_id") == token_id 
+                    and o.get("side", "").upper() == "SELL"
                 )
                 
-                # ⚠️ CRITICAL: Keep sell_size from accumulator, only reduce if necessary
-                # sell_size is already set from acc['size'] above
+                available_balance = actual_balance - locked_in_sells
+                original_sell_size = sell_size
                 
-                # 🛡️ SAFETY: Verify we have enough available balance
-                try:
-                    actual_balance = self.client.get_token_balance(token_id)
+                # Only reduce if available is LESS than what we want to sell
+                if available_balance < sell_size:
+                    if available_balance <= 0:
+                        logger.warning(
+                            f"⏳ Balance not available in flush (actual={actual_balance:.2f}, locked={locked_in_sells:.2f}). "
+                            f"Queuing {sell_size:.2f} shares for retry..."
+                        )
+                        pending = {
+                            'token_id': token_id,
+                            'side': side,
+                            'exit_price': exit_price,
+                            'size': sell_size,
+                            'slug': slug,
+                            'entry_price': avg_entry,
+                            'attempts': 0
+                        }
+                        self._pending_sells.append(pending)
+                        self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                        continue
                     
-                    # Check tokens locked in open sell orders
-                    open_orders = self.client.get_open_orders()
-                    locked_in_sells = sum(
-                        float(o.get("size", 0)) - float(o.get("size_matched", 0) or o.get("sizeMatched", 0))
-                        for o in open_orders
-                        if o.get("asset_id") == token_id 
-                        and o.get("side", "").upper() == "SELL"
-                    )
+                    # Check if adjustment would create dust
+                    if available_balance < MIN_SHARES:
+                        logger.warning(
+                            f"⏳ Available balance in flush ({available_balance:.2f}) < MIN_SHARES ({MIN_SHARES}). "
+                            f"Queuing ORIGINAL {sell_size:.2f} shares for retry"
+                        )
+                        pending = {
+                            'token_id': token_id,
+                            'side': side,
+                            'exit_price': exit_price,
+                            'size': sell_size,
+                            'slug': slug,
+                            'entry_price': avg_entry,
+                            'attempts': 0
+                        }
+                        self._pending_sells.append(pending)
+                        self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+                        continue
                     
-                    available_balance = actual_balance - locked_in_sells
+                    sell_size = available_balance
                     
-                    # Store original size for potential retry queue
-                    original_sell_size = sell_size
-                    
-                    # Only reduce if available is LESS than what we want to sell
-                    if available_balance < sell_size:
-                        if available_balance <= 0:
-                            logger.warning(
-                                f"⏳ Balance not available in flush (actual={actual_balance:.2f}, locked={locked_in_sells:.2f}). "
-                                f"Queuing {sell_size:.2f} shares for retry..."
-                            )
-                            # Add to pending_sells and continue (don't skip!)
-                            pending = {
-                                'token_id': token_id,
-                                'side': side,
-                                'exit_price': exit_price,
-                                'size': sell_size,
-                                'slug': slug,
-                                'entry_price': avg_entry,
-                                'attempts': 0
-                            }
-                            self._pending_sells.append(pending)
-                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                            continue
-                        
-                        # 🛡️ CRITICAL FIX: Check if adjustment would create dust
-                        if available_balance < MIN_SHARES:
-                            logger.warning(
-                                f"⏳ Available balance in flush ({available_balance:.2f}) < MIN_SHARES ({MIN_SHARES}). "
-                                f"Queuing ORIGINAL {sell_size:.2f} shares for retry (NOT losing them as dust!)"
-                            )
-                            pending = {
-                                'token_id': token_id,
-                                'side': side,
-                                'exit_price': exit_price,
-                                'size': sell_size,  # Original size, not adjusted dust!
-                                'slug': slug,
-                                'entry_price': avg_entry,
-                                'attempts': 0
-                            }
-                            self._pending_sells.append(pending)
-                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                            continue
-                        
-                        sell_size = available_balance  # Use exact balance from Polymarket
-                    
-                    # 🛡️ CRITICAL FIX: If adjusted to dust but original was NOT dust, queue for retry
-                    if sell_size < MIN_SHARES:
-                        if original_sell_size >= MIN_SHARES:
-                            logger.warning(
-                                f"⚠️ DUST PROTECTION in flush: sell_size={sell_size:.2f} but original={original_sell_size:.2f} >= {MIN_SHARES}. "
-                                f"Queuing FULL SIZE for retry!"
-                            )
-                            pending = {
-                                'token_id': token_id,
-                                'side': side,
-                                'exit_price': exit_price,
-                                'size': original_sell_size,  # Restore original
-                                'slug': slug,
-                                'entry_price': avg_entry,
-                                'attempts': 0
-                            }
-                            self._pending_sells.append(pending)
-                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                            continue
-                        else:
-                            logger.error(f"💀 DUST in flush (original): {sell_size:.2f} shares < {MIN_SHARES} min")
-                            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
-                            continue
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Balance check failed in flush: {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Balance check failed in flush: {e}")
+            
+            # Add to pending sells (will be processed immediately or retried)
+            pending = {
+                'token_id': token_id,
+                'side': side,
+                'exit_price': exit_price,
+                'size': sell_size,
+                'slug': slug,
+                'entry_price': avg_entry,
+                'attempts': 0
+            }
+            self._pending_sells.append(pending)
+            self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+        
+        # =========================================================================
+        # PHASE 2: Combine dust from same side and sell at 49¢ if >= MIN_SHARES
+        # =========================================================================
+        DUST_EXIT_PRICE = 0.49  # Arbitrary safe exit price for combined dust
+        
+        for side, dust_list in dust_by_side.items():
+            if not dust_list:
+                continue
                 
-                # Add to pending sells (will be processed immediately or retried)
+            # Sum all dust for this side
+            total_dust_size = sum(d['size'] for d in dust_list)
+            total_entry_value = sum(d['entry_value'] for d in dust_list)
+            
+            # Use the token_id from the first dust entry (they should all be the same for same side)
+            token_id = dust_list[0]['token_id']
+            
+            # Calculate weighted average entry price
+            avg_entry = total_entry_value / total_dust_size if total_dust_size > 0 else 0
+            
+            # Clear all dust accumulators regardless of outcome
+            for d in dust_list:
+                self._fill_accumulator[d['acc_key']] = {'size': 0.0, 'total_entry_value': 0.0}
+            
+            if total_dust_size >= MIN_SHARES:
+                # 🎉 Combined dust meets minimum - we can sell!
+                logger.warning(
+                    f"🧹 DUST COMBINATION: {len(dust_list)} fragments = {total_dust_size:.2f} {side.display_name} "
+                    f"(>= {MIN_SHARES} min). Selling at {int(DUST_EXIT_PRICE*100)}¢!"
+                )
+                
+                # Notify Telegram about the dust combination
+                self.notifier.send_message(
+                    f"🧹 DUST COMBINED ({slug})\n"
+                    f"{side.display_name}: {total_dust_size:.2f} shares from {len(dust_list)} levels\n"
+                    f"Selling at {int(DUST_EXIT_PRICE*100)}¢"
+                )
+                
+                # Add to pending sells at arbitrary 49¢
                 pending = {
                     'token_id': token_id,
                     'side': side,
-                    'exit_price': exit_price,
-                    'size': sell_size,
+                    'exit_price': DUST_EXIT_PRICE,
+                    'size': total_dust_size,
                     'slug': slug,
                     'entry_price': avg_entry,
                     'attempts': 0
                 }
                 self._pending_sells.append(pending)
-                
-                # Clear this accumulator
-                self._fill_accumulator[acc_key] = {'size': 0.0, 'total_entry_value': 0.0}
+            else:
+                # Still not enough even combined - truly locked
+                logger.error(
+                    f"💀 DUST LOCKED (combined): {total_dust_size:.2f} {side.display_name} < {MIN_SHARES} min. "
+                    f"({len(dust_list)} fragments). Will expire worthless!"
+                )
+                self.notifier.send_message(
+                    f"💀 DUST LOCKED ({slug})\n"
+                    f"{side.display_name}: {total_dust_size:.2f} shares ({len(dust_list)} fragments)\n"
+                    f"⚠️ Cannot sell - will expire worthless!"
+                )
     
     def _process_buy_fill(self, order: TrackedOrder, event: EventContext, fill_amount: Optional[float] = None) -> None:
         """Handle a buy order fill."""

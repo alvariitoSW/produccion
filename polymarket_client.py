@@ -274,7 +274,8 @@ class PolymarketClient:
         try:
             return self._client.get_order(order_id)
         except Exception as e:
-            logger.error(f"❌ Get order {order_id} failed: {e}")
+            # Log as debug - this is a transient API error that gets retried automatically
+            logger.debug(f"⏳ Get order {order_id[:8]}... failed (will retry): {e}")
             return {}
     
     def get_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
